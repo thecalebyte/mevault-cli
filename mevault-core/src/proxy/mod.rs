@@ -225,7 +225,9 @@ mod tests {
             AllowListConfig, DenyListConfig, ExpiryMode, ProjectConfig, ProjectMeta,
             SecurityConfig, SessionConfig, UnknownProcessMode,
         },
+        crypto::CryptoPolicy,
         session::{Session, SessionManager},
+        vault::VaultStore,
     };
     use axum::body::to_bytes;
     use axum::extract::connect_info::MockConnectInfo;
@@ -265,13 +267,22 @@ mod tests {
         let audit = Arc::new(AuditLog::open(&dir.path().join("a.db")).await.unwrap());
         let manager = SessionManager::new();
 
+        // Build a real vault with fast_test policy so proxy tests don't need
+        // to hold a password in a session — the DEK is cached in UnlockedVault.
+        let pw = SecretString::new("proxy-test-password".to_owned().into());
+        let store = VaultStore::new_at_with_policy(dir.path().to_path_buf(), CryptoPolicy::fast_test());
+        store.create_vault("TestVault", &pw).unwrap();
+        if !secrets.is_empty() {
+            store.set_secrets_bulk(&secrets, "TestVault", &pw).unwrap();
+        }
+        let vault = Arc::new(store.unlock("TestVault", &pw).unwrap());
+
         let session = Session::new(
-            "TestVault",
+            vault,
             ExpiryMode::Both,
             Some(8),
             std::process::id(),
             PathBuf::from("."),
-            secrets,
         );
         manager.start(session).await;
 

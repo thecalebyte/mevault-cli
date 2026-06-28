@@ -71,13 +71,14 @@ The previous version used an HTTP proxy at `127.0.0.1:52731`. Named pipes are st
 
 ### Trust model
 
-1. **Vault**: per-project AES-256-GCM encrypted file; each project has its own password and isolated store
-2. **Pipe server**: the only runtime path to a secret value; bound to named pipes, not the network
-3. **Kernel PID**: `GetNamedPipeClientProcessId` provides the real caller PID; the caller cannot forge this
-4. **Creation-time grant**: each connection records `(PID, creation_timestamp)`; re-verified on every request to detect PID recycling
-5. **Allow-list**: `mevault.toml` declares which executables, from which parents, in which directory, may access which secrets
-6. **Always-deny list**: AI agent executables are hardcoded as denied and cannot be overridden
-7. **System policy**: `%ProgramData%\MeVault\policy.toml` is admin-writable only; it overrides project config so agents cannot weaken security by editing `mevault.toml`
+1. **Vault**: per-project envelope-encrypted file (v2 format). Argon2id derives a Key-Encryption Key (KEK) from your password; the KEK unwraps a random 256-bit Data-Encryption Key (DEK); the DEK encrypts the secrets payload with AES-256-GCM. Each vault has a stable `vault_id` baked into the authenticated data (AAD), preventing ciphertext from one vault being transplanted into another.
+2. **Session DEK**: the DEK is cached in memory (`Zeroizing<[u8;32]>`) for the session lifetime. Argon2id runs **once** at unlock — not on every secret access. The KEK is zeroized immediately after unwrapping the DEK. When the session is locked or a time-based expiry fires, the DEK is zeroized automatically via RAII drop.
+3. **Pipe server**: the only runtime path to a secret value; bound to named pipes, not the network
+4. **Kernel PID**: `GetNamedPipeClientProcessId` provides the real caller PID; the caller cannot forge this
+5. **Creation-time grant**: each connection records `(PID, creation_timestamp)`; re-verified on every request to detect PID recycling
+6. **Allow-list**: `mevault.toml` declares which executables, from which parents, in which directory, may access which secrets
+7. **Always-deny list**: AI agent executables are hardcoded as denied and cannot be overridden
+8. **System policy**: `%ProgramData%\MeVault\policy.toml` is admin-writable only; it overrides project config so agents cannot weaken security by editing `mevault.toml`
 
 ### Request flow
 
@@ -285,7 +286,7 @@ Vault unlocked.
 Press Ctrl+C or run `mevault lock` to lock the vault.
 ```
 
-The session stays open until you lock it. No credentials are written to the environment. Secrets are decrypted on demand; only the requested secret is ever in memory.
+The session stays open until you lock it. No credentials are written to the environment or disk. Argon2id runs once at unlock and derives a session DEK that is held in memory, zeroized on lock. Each secret request reads the encrypted payload from disk and decrypts it with the cached DEK — no password or KDF work required after the initial unlock. If `expiry_mode` is `time` or `both`, a background task automatically zeroizes the DEK when the timer fires.
 
 ### `mevault run <command>`
 
@@ -438,12 +439,16 @@ A process is also denied if **any process in its parent chain** appears on this 
 |---|---|
 | Agent reads env vars | Secrets are never placed in env vars |
 | Agent reads session token | No session token exists; kernel PID is the gate |
-| Agent steals `session.json` | File contains only `session_id`, `vault_name`, `pid` with no credentials |
+| Agent steals `session.json` | File contains only `session_id`, `vault_name`, `pid` — no DEK, no password |
 | Agent spawns an approved process | Parent chain check catches the agent |
 | Agent edits `mevault.toml` | System policy (`%ProgramData%`) overrides project config |
 | Process impersonates approved exe | Authenticode signature check via WinVerifyTrust |
 | PID recycling attack | Creation timestamp bound at connection time, re-verified per request |
 | Port scanning / localhost probe | Named pipes have no port; not discoverable by network scanning |
+| Cross-vault ciphertext transplant | `vault_id` is baked into AES-GCM AAD; decryption fails if moved |
+| Vault file corruption mid-write | Atomic rename via UUID temp file; `sync_all` before promotion |
+| V1 vault upgrade data loss | Migration requires a verified backup before the new file is promoted |
+| Password change exposes old DEK | Password change rewraps the existing DEK; no re-encryption of secrets |
 
 ### What MeVault does not protect against
 
@@ -473,14 +478,14 @@ cargo build --release
 ### Running tests
 
 ```powershell
-# Unit + IPC tests
+# Unit + IPC + integration tests
 cargo test -p mevault-core
 
 # SDK tests
 cargo test -p mevault-sdk
 
-# Integration tests (isolated temp dirs, safe to run in parallel)
-cargo test -p mevault-core --test vault_integration
+# Cross-process file-lock correctness test (requires the test helper binary)
+cargo test -p mevault-core --features test-helper
 ```
 
 ### Project structure
@@ -492,8 +497,8 @@ crates/
       ipc/            named pipe servers (runtime + control) and client helpers
       identity/       Win32 process identity, Authenticode, Job Objects
       allowlist/      access control engine (TOML rules)
-      session/        session lifecycle, lazy decryption
-      vault/          per-project AES-256-GCM encrypted vault store
+      session/        session lifecycle, DEK caching and auto-expiry
+      vault/          per-project envelope-encrypted vault store (v2 KEK/DEK format)
       audit/          SQLite audit log
       config/         TOML config parsing + system policy
       crypto/         AES-256-GCM + Argon2id for vault and export/import

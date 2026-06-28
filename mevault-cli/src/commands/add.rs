@@ -100,11 +100,17 @@ async fn import_from_dotenv(
         return Ok(());
     }
 
-    let mut count = 0usize;
-    for (key, val) in &entries {
-        bridge
-            .set_secret(key, &SecretString::new(val.clone().into()), vault_name, password)
-            .with_context(|| format!("storing '{key}'"))?;
+    let pw = password.context("vault password is required")?;
+    let secrets_map: std::collections::HashMap<String, SecretString> = entries
+        .iter()
+        .map(|(k, v)| (k.clone(), SecretString::new(v.clone().into())))
+        .collect();
+
+    bridge
+        .set_secrets_bulk(&secrets_map, vault_name, pw)
+        .context("importing secrets into vault")?;
+
+    for (key, _) in &entries {
         audit
             .write(
                 AuditEvent::new(EventType::SecretAdded)
@@ -112,9 +118,9 @@ async fn import_from_dotenv(
                     .vault(vault_name),
             )
             .await?;
-        count += 1;
     }
 
+    let count = entries.len();
     println!(
         "Imported {count} secret(s) from {} into vault '{vault_name}'.",
         path.display()

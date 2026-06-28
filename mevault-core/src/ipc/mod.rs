@@ -17,7 +17,6 @@ use crate::{
     config::ProjectConfig,
     identity,
     session::SharedSession,
-    vault::SecretStoreBridge,
 };
 pub use protocol::{ControlRequest, ControlResponse, IpcRequest, IpcResponse};
 
@@ -171,10 +170,8 @@ async fn dispatch(
         }
 
         IpcRequest::GetSecret { name } => {
-            // Scope the lock so it is released BEFORE any blocking PS call.
-            // In lazy mode, keep only owned clones; in preloaded mode, the
-            // value is extracted as an owned String before the lock is dropped.
-            let (allowed, deny_reason, preloaded, lazy_params, vault_name, session_id) = {
+            // Scope the lock narrowly: clone Arc<UnlockedVault>, then drop lock.
+            let (allowed, deny_reason, vault, vault_name, session_id) = {
                 let lock = session.read().await;
                 let sess = match lock.as_ref() {
                     Some(s) if s.is_active() => s,
@@ -204,15 +201,11 @@ async fn dispatch(
                 (
                     allowed,
                     deny_reason,
-                    sess.get_secret(name).map(|s| {
-                        use secrecy::ExposeSecret;
-                        s.expose_secret().to_owned()
-                    }),
-                    sess.lazy_params(),
+                    sess.vault(),        // Arc<UnlockedVault> — cheap clone
                     sess.vault_name.clone(),
                     sess.id.to_string(),
                 )
-                // lock released here — no lock held beyond this point
+                // lock released here
             };
 
             if !allowed {
@@ -231,44 +224,28 @@ async fn dispatch(
                 return IpcResponse::err("access_denied", Some(reason));
             }
 
-            // Preloaded mode: value already in memory.
-            if let Some(value) = preloaded {
-                write_audit(
-                    audit,
-                    AuditEvent::new(EventType::Allowed)
-                        .secret(name)
-                        .vault(&vault_name)
-                        .session(session_id),
-                );
-                return IpcResponse::value(value);
+            // Use DEK from the unlocked vault — no Argon2, just AES-256-GCM.
+            let name_clone = name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                vault.get_secret(&name_clone)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(secret)) => {
+                    use secrecy::ExposeSecret;
+                    write_audit(
+                        audit,
+                        AuditEvent::new(EventType::Allowed)
+                            .secret(name)
+                            .vault(&vault_name)
+                            .session(session_id),
+                    );
+                    IpcResponse::value(secret.expose_secret().to_owned())
+                }
+                Ok(Err(_)) => IpcResponse::err("secret_not_found", Some(name.clone())),
+                Err(_) => IpcResponse::err("internal_error", None),
             }
-
-            // Lazy mode: decrypt on demand (spawns a PS subprocess, lock already free).
-            if let Some((password, lazy_vault)) = lazy_params {
-                let name_clone = name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    SecretStoreBridge::new().get_secret(&name_clone, &lazy_vault, Some(&password))
-                })
-                .await;
-
-                return match result {
-                    Ok(Ok(secret)) => {
-                        use secrecy::ExposeSecret;
-                        write_audit(
-                            audit,
-                            AuditEvent::new(EventType::Allowed)
-                                .secret(name)
-                                .vault(&vault_name)
-                                .session(session_id),
-                        );
-                        IpcResponse::value(secret.expose_secret().to_owned())
-                    }
-                    Ok(Err(_)) => IpcResponse::err("secret_not_found", Some(name.clone())),
-                    Err(_) => IpcResponse::err("internal_error", None),
-                };
-            }
-
-            IpcResponse::err("secret_not_found", Some(name.clone()))
         }
     }
 }

@@ -53,17 +53,16 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
     let db_path = PathBuf::from(appdata).join("MeVault").join("audit.db");
     let audit = AuditLog::open(&db_path).await.context("opening audit log")?;
 
-    let mut count = 0usize;
-    for entry in &entries {
-        bridge
-            .set_secret(
-                &entry.name,
-                &SecretString::new(entry.value.clone().into()),
-                vault_name,
-                Some(&vault_pw),
-            )
-            .with_context(|| format!("storing '{}'", entry.name))?;
+    let secrets_map: std::collections::HashMap<String, SecretString> = entries
+        .iter()
+        .map(|e| (e.name.clone(), SecretString::new(e.value.clone().into())))
+        .collect();
 
+    bridge
+        .set_secrets_bulk(&secrets_map, vault_name, &vault_pw)
+        .context("importing secrets into vault")?;
+
+    for entry in &entries {
         audit
             .write(
                 AuditEvent::new(EventType::SecretAdded)
@@ -71,10 +70,9 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
                     .vault(vault_name),
             )
             .await?;
-
-        count += 1;
     }
 
+    let count = entries.len();
     println!("Imported {count} secret(s) into vault '{vault_name}'.");
     Ok(())
 }

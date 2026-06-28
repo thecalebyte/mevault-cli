@@ -3,6 +3,16 @@ name = "mevault-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-helper = []
+
+[[bin]]
+name = "vault-write-helper"
+path = "src/bin/vault_write_helper.rs"
+required-features = ["test-helper"]
+test = false
+bench = false
+
 [dependencies]
 tokio.workspace = true
 axum.workspace = true
@@ -22,6 +32,7 @@ rand.workspace = true
 aes-gcm.workspace = true
 argon2.workspace = true
 base64.workspace = true
+fs2.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [

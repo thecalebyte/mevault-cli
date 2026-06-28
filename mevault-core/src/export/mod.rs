@@ -4,7 +4,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::crypto;
+use crate::crypto::{self, CryptoPolicy};
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -74,7 +74,7 @@ pub fn export_encrypted_env(
     }
     let plaintext = (lines.join("\n") + "\n").into_bytes();
 
-    let blob = crypto::encrypt(&plaintext, password).context("encrypting export")?;
+    let blob = crypto::encrypt(&plaintext, password, b"mevault-env-enc", &CryptoPolicy::production()).context("encrypting export")?;
     let json = serde_json::to_string_pretty(&blob).context("serializing encrypted export")?;
     std::fs::write(path, json)
         .with_context(|| format!("writing {}", path.display()))?;
@@ -89,7 +89,7 @@ pub fn export_mvx(
     password: &SecretString,
 ) -> Result<usize> {
     let inner_json = serde_json::to_string(secrets).context("serializing secret list")?;
-    let blob = crypto::encrypt(inner_json.as_bytes(), password).context("encrypting mvx")?;
+    let blob = crypto::encrypt(inner_json.as_bytes(), password, vault_name.as_bytes(), &CryptoPolicy::production()).context("encrypting mvx")?;
 
     let bundle = MvxBundle {
         format: "mevault-export".into(),
@@ -123,8 +123,8 @@ pub fn import_encrypted_env(path: &Path, password: &SecretString) -> Result<Vec<
         .with_context(|| format!("reading {}", path.display()))?;
     let blob: crypto::EncryptedBlob =
         serde_json::from_str(&json).context("parsing encrypted env file")?;
-    let plaintext = crypto::decrypt(&blob, password).context("decrypting env file")?;
-    let text = String::from_utf8(plaintext).context("decrypted content is not UTF-8")?;
+    let plaintext = crypto::decrypt(&blob, password, b"mevault-env-enc", &CryptoPolicy::production()).context("decrypting env file")?;
+    let text = std::str::from_utf8(&plaintext).context("decrypted content is not UTF-8")?.to_owned();
     Ok(parse_env_lines(&text))
 }
 
@@ -133,7 +133,7 @@ pub fn import_mvx(path: &Path, password: &SecretString) -> Result<(String, Vec<S
     let json = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
     let bundle: MvxBundle = serde_json::from_str(&json).context("parsing mvx file")?;
-    let plaintext = crypto::decrypt(&bundle.blob, password).context("decrypting mvx")?;
+    let plaintext = crypto::decrypt(&bundle.blob, password, bundle.vault.as_bytes(), &CryptoPolicy::production()).context("decrypting mvx")?;
     let entries: Vec<SecretEntry> =
         serde_json::from_slice(&plaintext).context("parsing decrypted secret list")?;
     Ok((bundle.vault, entries))

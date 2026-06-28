@@ -5,7 +5,7 @@ use mevault_core::{
     identity,
     ipc::{self, ControlRequest},
     session::{Session, SessionManager},
-    vault::SecretStoreBridge,
+    vault::VaultStore,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,24 +43,22 @@ pub async fn run(program: &str, args: &[String]) -> Result<()> {
     println!("Unlocking vault '{}'…", cfg.project.vault_name);
     let password = prompt_vault_password()?;
 
-    // Lazy unlock: keep password in session, decrypt secrets on demand.
-    let bridge = SecretStoreBridge::new();
-    let secret_names = bridge
-        .unlock_and_list_names(&cfg.project.vault_name, &password)
-        .context("failed to unlock vault")?;
-
-    let count = secret_names.len();
+    // Unlock vault once — Argon2 runs here; DEK cached in UnlockedVault.
+    let vault = Arc::new(
+        VaultStore::new()
+            .unlock(&cfg.project.vault_name, &password)
+            .context("failed to unlock vault")?,
+    );
+    let count = vault.secret_names().unwrap_or_default().len();
     println!("Found {count} secret(s). Starting runtime pipe…");
 
     let manager = SessionManager::new();
-    let session = Session::new_lazy(
-        &cfg.project.vault_name,
+    let session = Session::new(
+        Arc::clone(&vault),
         cfg.session.expiry_mode.clone(),
         Some(cfg.session.expiry_hours),
         std::process::id(),
         project_root.clone(),
-        password,
-        secret_names,
     );
     let session_id = session.id.to_string();
     manager.start(session).await;

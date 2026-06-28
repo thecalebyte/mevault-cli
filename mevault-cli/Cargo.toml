@@ -1,0 +1,25 @@
+[package]
+name = "mevault-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mevault"
+path = "src/main.rs"
+
+[dependencies]
+mevault-core = { path = "../mevault-core" }
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+uuid.workspace = true
+rand.workspace = true
+rpassword = "7"

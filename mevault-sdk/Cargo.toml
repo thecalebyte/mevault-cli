@@ -1,0 +1,11 @@
+[package]
+name = "mevault-sdk"
+version.workspace = true
+edition.workspace = true
+description = "Named-pipe client SDK for the MeVault secrets broker"
+
+[dependencies]
+secrecy.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true

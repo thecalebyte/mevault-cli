@@ -1,0 +1,27 @@
+PackageIdentifier: MeVault.MeVaultCLI
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: MeVault
+PublisherUrl: https://github.com/thecalebyte
+PublisherSupportUrl: https://github.com/thecalebyte/mevault-cli/issues
+PackageName: MeVault CLI
+PackageUrl: https://github.com/thecalebyte/mevault-cli
+License: Apache-2.0
+LicenseUrl: https://github.com/thecalebyte/mevault-cli/blob/main/LICENSE
+ShortDescription: Local-first secret manager that keeps credentials away from AI coding agents
+Description: |-
+  MeVault keeps your development secrets away from AI coding agents using Windows named
+  pipes and kernel-level process identity. Secrets are never placed in environment variables.
+  Each pipe request is verified against a hardcoded always-deny list for known AI agent
+  executables, a configurable allow-list, and eight kernel-level identity checks before
+  any value is returned. Supports lazy per-secret decryption, Windows Job Objects for
+  child process lifecycle management, and an admin-controlled system policy file that
+  agents cannot override.
+Tags:
+  - secrets
+  - security
+  - developer-tools
+  - credentials
+  - ai-safety
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

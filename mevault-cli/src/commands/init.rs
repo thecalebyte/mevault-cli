@@ -31,32 +31,15 @@ pub fn run(name: Option<String>, vault_dir: Option<PathBuf>) -> Result<()> {
 
     let bridge = SecretStoreBridge::new();
 
-    // Check modules
-    print!("Checking PowerShell SecretManagement modules... ");
-    match bridge.check_modules() {
-        Ok(true) => println!("OK"),
-        Ok(false) => {
-            println!("not found");
-            print!("Installing modules (requires internet)... ");
-            bridge.install_modules().context("installing SecretManagement modules")?;
-            println!("done");
-        }
-        Err(e) => {
-            println!("error: {e}");
-            bail!("Cannot check PowerShell modules. Ensure PowerShell 5.1+ is installed.");
-        }
-    }
-
-    // Check if vault already registered
     if bridge.vault_exists(&vault_name)? {
-        println!("Vault '{vault_name}' already exists in SecretStore — reusing it.");
+        println!("Vault '{vault_name}' already exists — reusing it.");
     } else {
         println!("\nSet master password for vault '{vault_name}':");
         let password = read_password_confirmed()?;
         print!("Creating vault '{vault_name}'... ");
         bridge
             .create_vault(&vault_name, &password)
-            .context("creating SecretStore vault")?;
+            .context("creating vault")?;
         println!("done");
     }
 

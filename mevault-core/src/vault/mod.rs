@@ -1,460 +1,33 @@
 use anyhow::{bail, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
-/// Thin wrapper over PowerShell SecretManagement / SecretStore.
+use crate::crypto;
+
+/// Per-project encrypted vault store.
 ///
-/// Security invariant: secret values are embedded in stdin, never in command-line args.
-/// PS single-quoted strings are used so `'` is the only character that needs escaping (`''`).
-pub struct SecretStoreBridge {
-    ps_path: PathBuf,
+/// Each project vault is an independent AES-256-GCM encrypted file at
+/// `%APPDATA%\MeVault\vaults\<name>.mvault`.  Projects never share a
+/// backing store or master password — creating one vault cannot affect another.
+///
+/// No PowerShell or SecretStore modules are required.
+pub struct VaultStore {
+    vault_dir: PathBuf,
 }
 
-impl SecretStoreBridge {
-    pub fn new() -> Self {
-        Self {
-            ps_path: PathBuf::from(
-                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            ),
-        }
-    }
+/// Backward-compatible alias — callers can use either name.
+pub type SecretStoreBridge = VaultStore;
 
-    // ── Module management ──────────────────────────────────────────────────
-
-    pub fn check_modules(&self) -> Result<bool> {
-        let out = self.run_ps(
-            r#"
-            $sm = Get-Module -ListAvailable -Name Microsoft.PowerShell.SecretManagement
-            $ss = Get-Module -ListAvailable -Name Microsoft.PowerShell.SecretStore
-            if ($sm -and $ss) { 'true' } else { 'false' }
-            "#,
-            &[],
-        )?;
-        Ok(out.trim() == "true")
-    }
-
-    pub fn install_modules(&self) -> Result<()> {
-        self.run_ps(
-            r#"
-            Install-Module Microsoft.PowerShell.SecretManagement -Force -Scope CurrentUser
-            Install-Module Microsoft.PowerShell.SecretStore      -Force -Scope CurrentUser
-            "#,
-            &[],
-        )
-        .context("installing SecretManagement modules")?;
-        Ok(())
-    }
-
-    // ── Vault lifecycle ────────────────────────────────────────────────────
-
-    /// Create and configure a new SecretStore vault.
-    ///
-    /// Uses `Reset-SecretStore` to properly initialize the SecretStore with the given
-    /// password, then registers the named vault.  `Set-SecretStoreConfiguration` alone
-    /// does not correctly initialize a fresh SecretStore — it creates a corrupted state
-    /// where subsequent `Unlock-SecretStore` calls fail with an integrity error.
-    ///
-    /// WARNING: `Reset-SecretStore -Force` clears any pre-existing secrets in the store.
-    /// On a truly fresh install there are none, so this is safe.  Phase 2 will add a
-    /// check that warns the user before overwriting an existing store.
-    pub fn create_vault(&self, vault_name: &str, password: &SecretString) -> Result<()> {
-        let script = format!(
-            r#"
-            Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-            Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-            $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-            # Reset-SecretStore properly initialises the store so that
-            # Unlock-SecretStore works in subsequent PS subprocesses.
-            # -Force suppresses the confirmation prompt.
-            Reset-SecretStore `
-                -Authentication Password `
-                -Password $secure `
-                -Interaction None `
-                -Force `
-                -ErrorAction Stop
-            # Register the vault if it is not already registered.
-            $existing = Get-SecretVault -Name '{vault_name}' -ErrorAction SilentlyContinue
-            if (-not $existing) {{
-                Register-SecretVault `
-                    -Name '{vault_name}' `
-                    -ModuleName Microsoft.PowerShell.SecretStore `
-                    -ErrorAction Stop
-            }}
-            "#,
-            vault_name = vault_name
-        );
-        self.run_ps(&script, &[("mevault_pw", password.expose_secret())])
-            .with_context(|| format!("creating vault '{vault_name}'"))?;
-        Ok(())
-    }
-
-    /// Unlock the SecretStore for subsequent operations in the same PS session.
-    /// Note: SecretStore caches the unlock state for its PasswordTimeout window
-    /// (default 15 min), so operations within that window don't need re-authentication.
-    pub fn unlock_vault(&self, password: &SecretString) -> Result<()> {
-        self.run_ps(
-            r#"
-            Import-Module Microsoft.PowerShell.SecretStore -ErrorAction Stop
-            $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-            Unlock-SecretStore -Password $secure -ErrorAction Stop
-            "#,
-            &[("mevault_pw", password.expose_secret())],
-        )
-        .context("unlocking SecretStore")?;
-        Ok(())
-    }
-
-    // ── Secret CRUD ────────────────────────────────────────────────────────
-
-    /// Store a secret. Provide `unlock_password` when the vault is locked.
-    /// For Phase 2 proxy usage, call `unlock_vault` once per session instead.
-    pub fn set_secret(
-        &self,
-        name: &str,
-        value: &SecretString,
-        vault_name: &str,
-        unlock_password: Option<&SecretString>,
-    ) -> Result<()> {
-        let (script, vars): (String, Vec<(&str, &str)>) = match unlock_password {
-            Some(pw) => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-                    $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-                    Unlock-SecretStore -Password $secure -ErrorAction Stop
-                    Set-Secret -Name '{name}' -Secret $mevault_val -Vault '{vault_name}' -ErrorAction Stop
-                    "#,
-                    name = name,
-                    vault_name = vault_name
-                ),
-                vec![
-                    ("mevault_pw", pw.expose_secret()),
-                    ("mevault_val", value.expose_secret()),
-                ],
-            ),
-            None => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Set-Secret -Name '{name}' -Secret $mevault_val -Vault '{vault_name}' -ErrorAction Stop
-                    "#,
-                    name = name,
-                    vault_name = vault_name
-                ),
-                vec![("mevault_val", value.expose_secret())],
-            ),
-        };
-        self.run_ps(&script, &vars)
-            .with_context(|| format!("setting secret '{name}' in vault '{vault_name}'"))?;
-        Ok(())
-    }
-
-    /// Fetch a secret value. Provide `unlock_password` when the vault is locked.
-    pub fn get_secret(
-        &self,
-        name: &str,
-        vault_name: &str,
-        unlock_password: Option<&SecretString>,
-    ) -> Result<SecretString> {
-        let (script, vars): (String, Vec<(&str, &str)>) = match unlock_password {
-            Some(pw) => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-                    $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-                    Unlock-SecretStore -Password $secure -ErrorAction Stop
-                    Write-Output (Get-Secret -Name '{name}' -Vault '{vault_name}' -AsPlainText -ErrorAction Stop)
-                    "#,
-                    name = name,
-                    vault_name = vault_name
-                ),
-                vec![("mevault_pw", pw.expose_secret())],
-            ),
-            None => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Write-Output (Get-Secret -Name '{name}' -Vault '{vault_name}' -AsPlainText -ErrorAction Stop)
-                    "#,
-                    name = name,
-                    vault_name = vault_name
-                ),
-                vec![],
-            ),
-        };
-        let raw = self
-            .run_ps(&script, &vars)
-            .with_context(|| format!("getting secret '{name}' from vault '{vault_name}'"))?;
-        Ok(SecretString::new(raw.trim().to_owned().into()))
-    }
-
-    /// Unlock the vault and return only the secret names — no values loaded.
-    ///
-    /// This is the v2 unlock path used with lazy decryption: the vault password
-    /// is kept in `Session`; individual secrets are decrypted per-request.
-    /// One PowerShell subprocess is spawned (unlock + list in a single call).
-    pub fn unlock_and_list_names(
-        &self,
-        vault_name: &str,
-        password: &SecretString,
-    ) -> Result<Vec<String>> {
-        let script = format!(
-            r#"
-            Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-            Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-            $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-            Unlock-SecretStore -Password $secure -ErrorAction Stop
-            Get-SecretInfo -Vault '{vault_name}' | ForEach-Object {{ $_.Name }}
-            "#,
-            vault_name = vault_name,
-        );
-        let out = self
-            .run_ps(&script, &[("mevault_pw", password.expose_secret())])
-            .with_context(|| format!("unlocking vault '{vault_name}' and listing names"))?;
-        Ok(out.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect())
-    }
-
-    /// Unlock the vault and load ALL secrets into memory in one PS subprocess.
-    ///
-    /// This is the Phase 2 unlock path: the proxy serves secrets from the returned
-    /// HashMap without further PS calls. SecretString zeroizes on drop.
-    pub fn unlock_and_preload(
-        &self,
-        vault_name: &str,
-        password: &SecretString,
-    ) -> Result<std::collections::HashMap<String, SecretString>> {
-        // Single PS script: unlock, iterate all secrets, output JSON.
-        // Using ConvertTo-Json so values with '=', quotes, or newlines are safe.
-        let script = format!(
-            r#"
-            Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-            Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-            $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-            Unlock-SecretStore -Password $secure -ErrorAction Stop
-            $result = @{{}}
-            Get-SecretInfo -Vault '{vault_name}' | ForEach-Object {{
-                $result[$_.Name] = (Get-Secret -Name $_.Name -Vault '{vault_name}' -AsPlainText)
-            }}
-            $result | ConvertTo-Json -Compress
-            "#,
-            vault_name = vault_name
-        );
-
-        let json = self
-            .run_ps(&script, &[("mevault_pw", password.expose_secret())])
-            .with_context(|| format!("unlocking and preloading vault '{vault_name}'"))?;
-
-        let json = json.trim();
-        if json.is_empty() || json == "null" {
-            return Ok(std::collections::HashMap::new());
-        }
-
-        let raw: serde_json::Value =
-            serde_json::from_str(json).context("parsing preloaded secrets JSON")?;
-
-        let mut map = std::collections::HashMap::new();
-        if let Some(obj) = raw.as_object() {
-            for (key, val) in obj {
-                if let Some(s) = val.as_str() {
-                    map.insert(key.clone(), SecretString::new(s.to_owned().into()));
-                }
-            }
-        }
-        Ok(map)
-    }
-
-    pub fn remove_secret(
-        &self,
-        name: &str,
-        vault_name: &str,
-        unlock_password: Option<&SecretString>,
-    ) -> Result<()> {
-        let (script, vars): (String, Vec<(&str, &str)>) = match unlock_password {
-            Some(pw) => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-                    $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-                    Unlock-SecretStore -Password $secure -ErrorAction Stop
-                    Remove-Secret -Name '{name}' -Vault '{vault_name}' -ErrorAction Stop
-                    "#,
-                    name = name,
-                    vault_name = vault_name
-                ),
-                vec![("mevault_pw", pw.expose_secret())],
-            ),
-            None => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Remove-Secret -Name '{name}' -Vault '{vault_name}' -ErrorAction Stop
-                    "#,
-                    name = name,
-                    vault_name = vault_name
-                ),
-                vec![],
-            ),
-        };
-        self.run_ps(&script, &vars)
-            .with_context(|| format!("removing secret '{name}' from vault '{vault_name}'"))?;
-        Ok(())
-    }
-
-    /// List secret metadata. Provide `unlock_password` when the vault is locked.
-    /// Note: `Get-SecretInfo` returns metadata (name/type), not values. On some
-    /// SecretStore configurations it works without unlocking; if it fails with a
-    /// vault-locked error the caller should retry with a password.
-    pub fn list_secrets(
-        &self,
-        vault_name: &str,
-        unlock_password: Option<&SecretString>,
-    ) -> Result<Vec<SecretInfo>> {
-        let (script, vars): (String, Vec<(&str, &str)>) = match unlock_password {
-            Some(pw) => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Import-Module Microsoft.PowerShell.SecretStore      -ErrorAction Stop
-                    $secure = ConvertTo-SecureString -String $mevault_pw -AsPlainText -Force
-                    Unlock-SecretStore -Password $secure -ErrorAction Stop
-                    Get-SecretInfo -Vault '{vault_name}' | ForEach-Object {{ "$($_.Name)|$($_.Type)" }}
-                    "#,
-                    vault_name = vault_name
-                ),
-                vec![("mevault_pw", pw.expose_secret())],
-            ),
-            None => (
-                format!(
-                    r#"
-                    Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-                    Get-SecretInfo -Vault '{vault_name}' | ForEach-Object {{ "$($_.Name)|$($_.Type)" }}
-                    "#,
-                    vault_name = vault_name
-                ),
-                vec![],
-            ),
-        };
-        let out = self
-            .run_ps(&script, &vars)
-            .with_context(|| format!("listing secrets in vault '{vault_name}'"))?;
-
-        let secrets = out
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|line| {
-                let mut parts = line.splitn(2, '|');
-                SecretInfo {
-                    name: parts.next().unwrap_or("").trim().to_owned(),
-                    kind: parts.next().unwrap_or("String").trim().to_owned(),
-                }
-            })
-            .collect();
-
-        Ok(secrets)
-    }
-
-    pub fn list_vaults(&self) -> Result<Vec<String>> {
-        let out = self.run_ps(
-            r#"
-            Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-            Get-SecretVault | Select-Object -ExpandProperty Name
-            "#,
-            &[],
-        )?;
-        Ok(out
-            .lines()
-            .map(|l| l.trim().to_owned())
-            .filter(|l| !l.is_empty())
-            .collect())
-    }
-
-    pub fn vault_exists(&self, vault_name: &str) -> Result<bool> {
-        let script = format!(
-            r#"
-            Import-Module Microsoft.PowerShell.SecretManagement -ErrorAction Stop
-            $v = Get-SecretVault -Name '{vault_name}' -ErrorAction SilentlyContinue
-            if ($v) {{ 'true' }} else {{ 'false' }}
-            "#,
-            vault_name = vault_name
-        );
-        let out = self.run_ps(&script, &[])?;
-        Ok(out.trim() == "true")
-    }
-
-    // ── Internal ───────────────────────────────────────────────────────────
-
-    /// Run a PowerShell script, optionally embedding named secret variables.
-    ///
-    /// Each entry in `vars` becomes a PS variable assignment prepended to the script:
-    ///   `$name = 'value'`   (single-quote escaped — safe for arbitrary string content)
-    ///
-    /// This keeps values out of command-line arguments (which would be visible in the
-    /// process list) and out of the value/script interleaving that the old `$input`
-    /// approach attempted.
-    fn run_ps(&self, script: &str, vars: &[(&str, &str)]) -> Result<String> {
-        // Build preamble: one PS variable assignment per entry.
-        let mut preamble = String::new();
-        for (name, val) in vars {
-            // In PS single-quoted strings, the only escape is '' for a literal '.
-            let escaped = val.replace('\'', "''");
-            preamble.push_str(&format!("${name} = '{escaped}'\n"));
-        }
-        let full_script = format!("{preamble}{script}");
-
-        let mut child = Command::new(&self.ps_path)
-            .args([
-                "-NonInteractive",
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning PowerShell")?;
-
-        let stdin = child.stdin.take().expect("stdin configured");
-        {
-            let mut w = std::io::BufWriter::new(stdin);
-            w.write_all(full_script.as_bytes())
-                .context("writing script to PowerShell stdin")?;
-        }
-
-        let out = child
-            .wait_with_output()
-            .context("waiting for PowerShell process")?;
-
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            bail!(
-                "PowerShell exited {}: {}{}",
-                out.status.code().unwrap_or(-1),
-                stderr.trim(),
-                if stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", stdout.trim())
-                }
-            );
-        }
-
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-}
-
-impl Default for SecretStoreBridge {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Serialize, Deserialize)]
+struct VaultFile {
+    format: String,
+    version: String,
+    name: String,
+    created_at: String,
+    blob: crypto::EncryptedBlob,
 }
 
 #[derive(Debug, Clone)]
@@ -463,30 +36,353 @@ pub struct SecretInfo {
     pub kind: String,
 }
 
+impl VaultStore {
+    pub fn new() -> Self {
+        let vault_dir = std::env::var("APPDATA")
+            .map(|a| PathBuf::from(a).join("MeVault").join("vaults"))
+            .unwrap_or_else(|_| PathBuf::from(".mevault").join("vaults"));
+        Self { vault_dir }
+    }
+
+    // ── Vault lifecycle ────────────────────────────────────────────────────
+
+    /// Create a new encrypted vault file for this project.
+    ///
+    /// Idempotent — if the vault file already exists the call succeeds without
+    /// changing the file or its password.  Use [`vault_exists`] to distinguish
+    /// first-time creation from a no-op.
+    pub fn create_vault(&self, vault_name: &str, password: &SecretString) -> Result<()> {
+        std::fs::create_dir_all(&self.vault_dir)
+            .context("creating vault directory")?;
+        let path = self.vault_path(vault_name)?;
+        if path.exists() {
+            return Ok(());
+        }
+        let empty: HashMap<String, String> = HashMap::new();
+        self.write_vault_file(&path, vault_name, &empty, password)
+    }
+
+    pub fn vault_exists(&self, vault_name: &str) -> Result<bool> {
+        Ok(self.vault_path(vault_name)?.exists())
+    }
+
+    pub fn list_vaults(&self) -> Result<Vec<String>> {
+        if !self.vault_dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut names = vec![];
+        for entry in std::fs::read_dir(&self.vault_dir).context("reading vault directory")? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("mvault") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_owned());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    // ── Secret CRUD ────────────────────────────────────────────────────────
+
+    pub fn set_secret(
+        &self,
+        name: &str,
+        value: &SecretString,
+        vault_name: &str,
+        password: Option<&SecretString>,
+    ) -> Result<()> {
+        let pw = password.context("vault password is required")?;
+        let path = self.vault_path(vault_name)?;
+        let mut secrets = if path.exists() {
+            self.read_secrets(&path, vault_name, pw)?
+        } else {
+            std::fs::create_dir_all(&self.vault_dir)?;
+            HashMap::new()
+        };
+        secrets.insert(name.to_owned(), value.expose_secret().to_owned());
+        self.write_vault_file(&path, vault_name, &secrets, pw)?;
+        secrets.values_mut().for_each(|v| v.zeroize());
+        Ok(())
+    }
+
+    pub fn get_secret(
+        &self,
+        name: &str,
+        vault_name: &str,
+        password: Option<&SecretString>,
+    ) -> Result<SecretString> {
+        let pw = password.context("vault password is required")?;
+        let path = self.vault_path(vault_name)?;
+        let mut secrets = self.read_secrets(&path, vault_name, pw)?;
+        let value = secrets
+            .remove(name)
+            .with_context(|| format!("secret '{name}' not found in vault '{vault_name}'"))?;
+        secrets.values_mut().for_each(|v| v.zeroize());
+        Ok(SecretString::new(value.into()))
+    }
+
+    pub fn remove_secret(
+        &self,
+        name: &str,
+        vault_name: &str,
+        password: Option<&SecretString>,
+    ) -> Result<()> {
+        let pw = password.context("vault password is required")?;
+        let path = self.vault_path(vault_name)?;
+        let mut secrets = self.read_secrets(&path, vault_name, pw)?;
+        secrets.remove(name);
+        self.write_vault_file(&path, vault_name, &secrets, pw)?;
+        secrets.values_mut().for_each(|v| v.zeroize());
+        Ok(())
+    }
+
+    pub fn list_secrets(
+        &self,
+        vault_name: &str,
+        password: Option<&SecretString>,
+    ) -> Result<Vec<SecretInfo>> {
+        let pw = password.context("vault password is required")?;
+        let path = self.vault_path(vault_name)?;
+        let mut secrets = self.read_secrets(&path, vault_name, pw)?;
+        let mut infos: Vec<SecretInfo> = secrets
+            .keys()
+            .map(|k| SecretInfo { name: k.clone(), kind: "String".to_owned() })
+            .collect();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        secrets.values_mut().for_each(|v| v.zeroize());
+        Ok(infos)
+    }
+
+    /// Unlock and return only secret names — no values loaded into memory.
+    /// This is the v2 lazy-decryption unlock path.
+    pub fn unlock_and_list_names(
+        &self,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<Vec<String>> {
+        let path = self.vault_path(vault_name)?;
+        let mut secrets = self.read_secrets(&path, vault_name, password)?;
+        let mut names: Vec<String> = secrets.keys().cloned().collect();
+        names.sort();
+        secrets.values_mut().for_each(|v| v.zeroize());
+        Ok(names)
+    }
+
+    /// Unlock and preload all secret values. Used by proxy integration tests.
+    pub fn unlock_and_preload(
+        &self,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<HashMap<String, SecretString>> {
+        let path = self.vault_path(vault_name)?;
+        let secrets = self.read_secrets(&path, vault_name, password)?;
+        Ok(secrets.into_iter().map(|(k, v)| (k, SecretString::new(v.into()))).collect())
+    }
+
+    // ── Module stubs — PowerShell SecretStore modules no longer required ────
+
+    pub fn check_modules(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    pub fn install_modules(&self) -> Result<()> {
+        Ok(())
+    }
+
+    // ── Internal ───────────────────────────────────────────────────────────
+
+    fn vault_path(&self, vault_name: &str) -> Result<PathBuf> {
+        let safe = sanitize_vault_name(vault_name)?;
+        Ok(self.vault_dir.join(format!("{safe}.mvault")))
+    }
+
+    fn read_secrets(
+        &self,
+        path: &Path,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<HashMap<String, String>> {
+        let json = std::fs::read_to_string(path)
+            .with_context(|| {
+                format!("vault '{vault_name}' not found — run `mevault init` first")
+            })?;
+        let file: VaultFile =
+            serde_json::from_str(&json).context("vault file is corrupt or unrecognised format")?;
+        let mut plaintext =
+            crypto::decrypt(&file.blob, password).context("wrong password or corrupt vault")?;
+        let secrets: HashMap<String, String> =
+            serde_json::from_slice(&plaintext).context("vault contents are corrupt")?;
+        plaintext.zeroize();
+        Ok(secrets)
+    }
+
+    fn write_vault_file(
+        &self,
+        path: &Path,
+        vault_name: &str,
+        secrets: &HashMap<String, String>,
+        password: &SecretString,
+    ) -> Result<()> {
+        let mut plaintext = serde_json::to_vec(secrets).context("serialising secrets")?;
+        let blob = crypto::encrypt(&plaintext, password).context("encrypting vault")?;
+        plaintext.zeroize();
+
+        let file = VaultFile {
+            format: "mevault-vault".to_owned(),
+            version: "1".to_owned(),
+            name: vault_name.to_owned(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            blob,
+        };
+        let json = serde_json::to_string_pretty(&file).context("serialising vault file")?;
+
+        // Atomic write — write to a temp file then rename so a crash mid-write
+        // cannot leave the vault file in a corrupt state.
+        let tmp = path.with_extension("mvault.tmp");
+        std::fs::write(&tmp, &json)
+            .with_context(|| format!("writing temp file {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("finalising vault file {}", path.display()))?;
+        Ok(())
+    }
+}
+
+impl Default for VaultStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Sanitise a vault name so it is safe to use as a filename.
+/// Any character that is not alphanumeric, `-`, or `_` becomes `_`.
+fn sanitize_vault_name(name: &str) -> Result<String> {
+    if name.is_empty() {
+        bail!("vault name cannot be empty");
+    }
+    Ok(name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verify that run_ps embeds variables correctly and the script can read them.
-    /// This test does not touch SecretStore — it only checks the PS invocation plumbing.
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn run_ps_variable_embedding() {
-        let bridge = SecretStoreBridge::new();
-        let out = bridge
-            .run_ps("Write-Output $mevault_val", &[("mevault_val", "hello world")])
-            .expect("PS invocation failed");
-        assert_eq!(out.trim(), "hello world");
+    fn pw() -> SecretString {
+        SecretString::new("correct-horse-battery-staple".to_owned().into())
+    }
+
+    fn store(dir: &tempfile::TempDir) -> VaultStore {
+        VaultStore { vault_dir: dir.path().to_path_buf() }
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
-    fn run_ps_single_quote_escape() {
-        let bridge = SecretStoreBridge::new();
-        let tricky = "it's a test";
-        let out = bridge
-            .run_ps("Write-Output $mevault_val", &[("mevault_val", tricky)])
-            .expect("PS invocation failed");
-        assert_eq!(out.trim(), tricky);
+    fn create_and_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        assert!(!s.vault_exists("TestVault").unwrap());
+        s.create_vault("TestVault", &pw()).unwrap();
+        assert!(s.vault_exists("TestVault").unwrap());
+    }
+
+    #[test]
+    fn create_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.create_vault("V", &pw()).unwrap();
+        s.create_vault("V", &pw()).unwrap();
+        assert!(s.vault_exists("V").unwrap());
+    }
+
+    #[test]
+    fn set_get_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.create_vault("V", &pw()).unwrap();
+
+        let val = SecretString::new("postgres://localhost".to_owned().into());
+        s.set_secret("DB_URL", &val, "V", Some(&pw())).unwrap();
+
+        let got = s.get_secret("DB_URL", "V", Some(&pw())).unwrap();
+        assert_eq!(got.expose_secret(), "postgres://localhost");
+
+        s.remove_secret("DB_URL", "V", Some(&pw())).unwrap();
+        assert!(s.get_secret("DB_URL", "V", Some(&pw())).is_err());
+    }
+
+    #[test]
+    fn wrong_password_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.create_vault("V", &pw()).unwrap();
+        s.set_secret("K", &SecretString::new("v".to_owned().into()), "V", Some(&pw())).unwrap();
+        let bad = SecretString::new("wrong-password".to_owned().into());
+        assert!(s.get_secret("K", "V", Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn list_and_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.create_vault("V", &pw()).unwrap();
+        s.set_secret("A", &SecretString::new("1".to_owned().into()), "V", Some(&pw())).unwrap();
+        s.set_secret("B", &SecretString::new("2".to_owned().into()), "V", Some(&pw())).unwrap();
+        let names = s.unlock_and_list_names("V", &pw()).unwrap();
+        assert!(names.contains(&"A".to_owned()));
+        assert!(names.contains(&"B".to_owned()));
+    }
+
+    #[test]
+    fn list_vaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.create_vault("Alpha", &pw()).unwrap();
+        s.create_vault("Beta", &pw()).unwrap();
+        let vaults = s.list_vaults().unwrap();
+        assert!(vaults.contains(&"Alpha".to_owned()));
+        assert!(vaults.contains(&"Beta".to_owned()));
+    }
+
+    #[test]
+    fn vaults_are_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        let pw_a = SecretString::new("password-for-project-a".to_owned().into());
+        let pw_b = SecretString::new("password-for-project-b".to_owned().into());
+
+        s.create_vault("ProjectA", &pw_a).unwrap();
+        s.create_vault("ProjectB", &pw_b).unwrap();
+
+        s.set_secret("SECRET", &SecretString::new("value-a".to_owned().into()), "ProjectA", Some(&pw_a)).unwrap();
+        s.set_secret("SECRET", &SecretString::new("value-b".to_owned().into()), "ProjectB", Some(&pw_b)).unwrap();
+
+        let a = s.get_secret("SECRET", "ProjectA", Some(&pw_a)).unwrap();
+        let b = s.get_secret("SECRET", "ProjectB", Some(&pw_b)).unwrap();
+        assert_eq!(a.expose_secret(), "value-a");
+        assert_eq!(b.expose_secret(), "value-b");
+
+        // ProjectA's password cannot open ProjectB.
+        assert!(s.get_secret("SECRET", "ProjectB", Some(&pw_a)).is_err());
+        // ProjectB's password cannot open ProjectA.
+        assert!(s.get_secret("SECRET", "ProjectA", Some(&pw_b)).is_err());
+    }
+
+    #[test]
+    fn single_quote_and_special_chars_in_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.create_vault("V", &pw()).unwrap();
+        let tricky = SecretString::new("it's a \"test\" value\n with newline".to_owned().into());
+        s.set_secret("K", &tricky, "V", Some(&pw())).unwrap();
+        let got = s.get_secret("K", "V", Some(&pw())).unwrap();
+        assert_eq!(got.expose_secret(), "it's a \"test\" value\n with newline");
+    }
+
+    #[test]
+    fn sanitize_name_replaces_special_chars() {
+        assert_eq!(sanitize_vault_name("My Vault!").unwrap(), "My_Vault_");
+        assert_eq!(sanitize_vault_name("alpha-beta_1").unwrap(), "alpha-beta_1");
+        assert!(sanitize_vault_name("").is_err());
     }
 }

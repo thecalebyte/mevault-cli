@@ -100,14 +100,10 @@ async fn import_from_dotenv(
         return Ok(());
     }
 
-    // Use the password only on the first call; SecretStore remains unlocked
-    // for its PasswordTimeout window (default 15 min) so subsequent calls don't need it.
-    let mut first = true;
     let mut count = 0usize;
     for (key, val) in &entries {
-        let pw = if first { password } else { None };
         bridge
-            .set_secret(key, &SecretString::new(val.clone().into()), vault_name, pw)
+            .set_secret(key, &SecretString::new(val.clone().into()), vault_name, password)
             .with_context(|| format!("storing '{key}'"))?;
         audit
             .write(
@@ -116,7 +112,6 @@ async fn import_from_dotenv(
                     .vault(vault_name),
             )
             .await?;
-        first = false;
         count += 1;
     }
 

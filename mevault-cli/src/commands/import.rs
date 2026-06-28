@@ -54,19 +54,13 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
     let audit = AuditLog::open(&db_path).await.context("opening audit log")?;
 
     let mut count = 0usize;
-    // Pass the vault password only on the first secret; SecretStore stays unlocked
-    // within its PasswordTimeout window for the same-process subsequent calls.
-    // Pass the vault password only on the first secret;
-    // SecretStore stays unlocked for its PasswordTimeout window for this process.
-    let mut first = true;
     for entry in &entries {
-        let pw = if first { Some(&vault_pw) } else { None };
         bridge
             .set_secret(
                 &entry.name,
                 &SecretString::new(entry.value.clone().into()),
                 vault_name,
-                pw,
+                Some(&vault_pw),
             )
             .with_context(|| format!("storing '{}'", entry.name))?;
 
@@ -78,7 +72,6 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
             )
             .await?;
 
-        first = false;
         count += 1;
     }
 

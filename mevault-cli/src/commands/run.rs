@@ -7,30 +7,37 @@ use mevault_core::{
     session::{Session, SessionManager},
     vault::VaultStore,
 };
+use secrecy::ExposeSecret;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::commands::add::prompt_vault_password;
 
-/// `mevault run <program> [args…]`
+/// `mevault run [--inject-env] <program> [args…]`
 ///
 /// Two modes:
 ///   1. A session is already running (`mevault unlock`): spawn the child
 ///      directly — it uses the named pipes for secrets.
 ///   2. No session running: unlock inline, start ephemeral pipe servers,
 ///      place the child in a Job Object, run it, then shut everything down.
-pub async fn run(program: &str, args: &[String]) -> Result<()> {
+///
+/// With `--inject-env`, secrets are injected as environment variables instead
+/// of being served through the proxy. This is less secure (values visible to
+/// child sub-processes) and always requires an inline unlock.
+pub async fn run(program: &str, args: &[String], inject_env: bool) -> Result<()> {
     if program.is_empty() {
         bail!("Usage: mevault run <program> [args…]");
     }
 
     // ── Check for an existing session via the control pipe ────────────────
-    if matches!(
+    // --inject-env always uses inline unlock so we have direct vault access.
+    if !inject_env && matches!(
         ipc::send_control(&ControlRequest::Status).await,
         Ok(resp) if resp.ok && resp.active.unwrap_or(false)
     ) {
-        return spawn_child_in_job(program, args).await;
+        return spawn_child_in_job(program, args, None).await;
     }
 
     // ── Inline unlock + ephemeral pipe servers ────────────────────────────
@@ -49,7 +56,23 @@ pub async fn run(program: &str, args: &[String]) -> Result<()> {
             .unlock(&cfg.project.vault_name, &password)
             .context("failed to unlock vault")?,
     );
-    let count = vault.secret_names().unwrap_or_default().len();
+    let names = vault.secret_names().unwrap_or_default();
+    let count = names.len();
+
+    // Collect secrets for env injection before the pipe servers start.
+    let env_vars: Option<HashMap<String, String>> = if inject_env {
+        eprintln!("⚠ --inject-env: secrets will be visible to child sub-processes and in the environment.");
+        let mut map = HashMap::with_capacity(count);
+        for name in &names {
+            if let Ok(val) = vault.get_secret(name) {
+                map.insert(name.clone(), val.expose_secret().to_owned());
+            }
+        }
+        Some(map)
+    } else {
+        None
+    };
+
     println!("Found {count} secret(s). Starting runtime pipe…");
 
     let manager = SessionManager::new();
@@ -103,7 +126,7 @@ pub async fn run(program: &str, args: &[String]) -> Result<()> {
     // Give pipe servers a moment to bind.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    let exit_status = spawn_child_in_job(program, args).await;
+    let exit_status = spawn_child_in_job(program, args, env_vars.as_ref()).await;
 
     let _ = kill_tx_after_child.send(()).await;
     let _ = pipe_handle.await;
@@ -123,13 +146,21 @@ pub async fn run(program: &str, args: &[String]) -> Result<()> {
 
 /// Spawn `program` in a Windows Job Object with KILL_ON_JOB_CLOSE.
 /// Dropping the returned job kills the child and any processes it spawned.
-/// This is used both in ephemeral mode (inline unlock) and when re-using an
-/// existing persistent session.
-async fn spawn_child_in_job(program: &str, args: &[String]) -> Result<()> {
+/// `env_vars` — when `Some`, injects those key/value pairs into the child's
+/// environment in addition to the inherited environment (--inject-env mode).
+async fn spawn_child_in_job(
+    program: &str,
+    args: &[String],
+    env_vars: Option<&HashMap<String, String>>,
+) -> Result<()> {
     let job = identity::create_job_object().context("creating job object")?;
 
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    if let Some(vars) = env_vars {
+        cmd.envs(vars);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning '{program}'"))?;
 

@@ -47,6 +47,11 @@ enum Commands {
         /// Arguments passed to the program
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+        /// Inject secrets as environment variables (less secure — values
+        /// visible to child subprocesses; use only for legacy apps that
+        /// cannot use the MeVault SDK or named-pipe proxy)
+        #[arg(long)]
+        inject_env: bool,
     },
 
     /// Add a secret to the vault
@@ -133,8 +138,8 @@ async fn main() -> Result<()> {
         Commands::Status => {
             commands::status::run().await?;
         }
-        Commands::Run { program, args } => {
-            commands::run::run(&program, &args).await?;
+        Commands::Run { program, args, inject_env } => {
+            commands::run::run(&program, &args, inject_env).await?;
         }
         Commands::Add { name, from_env, generate } => {
             commands::add::run(name, from_env, generate).await?;

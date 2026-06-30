@@ -1,8 +1,9 @@
-pub mod audit;
 pub mod allowlist;
+pub mod audit;
 pub mod config;
 pub mod crypto;
 pub mod export;
+pub mod grants;
 pub mod identity;
 pub mod ipc;
 pub mod proxy;

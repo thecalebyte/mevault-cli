@@ -46,23 +46,38 @@ impl Session {
             }
             ExpiryMode::Terminal => None,
         };
-        Self { id, vault_name, started_at, expires_at, expiry_mode, terminal_pid, project_root, vault }
+        Self {
+            id,
+            vault_name,
+            started_at,
+            expires_at,
+            expiry_mode,
+            terminal_pid,
+            project_root,
+            vault,
+        }
     }
 
     pub fn state(&self) -> SessionState {
         if let Some(exp) = self.expires_at {
-            if Utc::now() >= exp { return SessionState::Expired; }
+            if Utc::now() >= exp {
+                return SessionState::Expired;
+            }
         }
         SessionState::Active
     }
 
-    pub fn is_active(&self) -> bool { self.state() == SessionState::Active }
+    pub fn is_active(&self) -> bool {
+        self.state() == SessionState::Active
+    }
 
     pub fn time_remaining(&self) -> Option<chrono::Duration> {
         self.expires_at.map(|exp| exp - Utc::now())
     }
 
-    pub fn vault(&self) -> Arc<UnlockedVault> { Arc::clone(&self.vault) }
+    pub fn vault(&self) -> Arc<UnlockedVault> {
+        Arc::clone(&self.vault)
+    }
 
     pub fn get_secret(&self, name: &str) -> Option<SecretString> {
         self.vault.get_secret(name).ok()
@@ -84,7 +99,9 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self { inner: Arc::new(RwLock::new(None)) }
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// Store a session and, if it has a time-based expiry, spawn a task that
@@ -104,9 +121,7 @@ impl SessionManager {
 
         if let Some(expiry) = expires_at {
             tokio::spawn(async move {
-                let delay = (expiry - Utc::now())
-                    .to_std()
-                    .unwrap_or_default(); // clamp to zero if already past
+                let delay = (expiry - Utc::now()).to_std().unwrap_or_default(); // clamp to zero if already past
                 tokio::time::sleep(delay).await;
 
                 // Upgrade only if SessionManager still exists.
@@ -132,7 +147,10 @@ impl SessionManager {
         let mut guard = self.inner.write().await;
         match guard.as_ref() {
             Some(s) if s.is_active() => true,
-            Some(_) => { guard.take(); false }
+            Some(_) => {
+                guard.take();
+                false
+            }
             None => false,
         }
     }
@@ -154,11 +172,15 @@ impl SessionManager {
         }
     }
 
-    pub fn shared(&self) -> SharedSession { Arc::clone(&self.inner) }
+    pub fn shared(&self) -> SharedSession {
+        Arc::clone(&self.inner)
+    }
 }
 
 impl Default for SessionManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -173,12 +195,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store =
             VaultStore::new_at_with_policy(dir.path().to_path_buf(), CryptoPolicy::fast_test());
-        let pw = SecretString::new("test-password".to_owned().into());
+        let pw = SecretString::new("test-password".to_owned());
         store.create_vault("TestVault", &pw).unwrap();
         store
             .set_secret(
                 "DB_URL",
-                &SecretString::new("postgres://test".to_owned().into()),
+                &SecretString::new("postgres://test".to_owned()),
                 "TestVault",
                 Some(&pw),
             )
@@ -203,7 +225,9 @@ mod tests {
         manager.start(session).await;
         assert!(manager.is_active().await);
 
-        let found = manager.with_session(|s| s.get_secret("DB_URL").is_some()).await;
+        let found = manager
+            .with_session(|s| s.get_secret("DB_URL").is_some())
+            .await;
         assert_eq!(found, Some(true));
 
         manager.end().await;
@@ -233,7 +257,10 @@ mod tests {
 
         // The slot must now be empty (DEK already zeroized).
         let guard = manager.inner.read().await;
-        assert!(guard.is_none(), "expired session must be removed from manager");
+        assert!(
+            guard.is_none(),
+            "expired session must be removed from manager"
+        );
     }
 
     #[tokio::test]
@@ -246,7 +273,10 @@ mod tests {
         session.expires_at = Some(Utc::now() + chrono::Duration::milliseconds(50));
         manager.start(session).await;
 
-        assert!(manager.is_active().await, "session must be active before expiry");
+        assert!(
+            manager.is_active().await,
+            "session must be active before expiry"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -276,7 +306,10 @@ mod tests {
 
         // Session 2 must still be present — the old timer must not evict it.
         let guard = manager.inner.read().await;
-        assert!(guard.is_some(), "replacement session must not be evicted by old timer");
+        assert!(
+            guard.is_some(),
+            "replacement session must not be evicted by old timer"
+        );
         assert_eq!(guard.as_ref().map(|s| s.id), Some(s2_id));
     }
 }

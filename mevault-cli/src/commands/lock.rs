@@ -10,6 +10,9 @@ pub async fn run() -> Result<()> {
         println!("Vault locked.");
         Ok(())
     } else {
-        bail!("lock failed: {}", resp.error.unwrap_or_else(|| "unknown error".to_owned()))
+        bail!(
+            "lock failed: {}",
+            resp.error.unwrap_or_else(|| "unknown error".to_owned())
+        )
     }
 }

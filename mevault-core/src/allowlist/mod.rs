@@ -58,10 +58,7 @@ pub fn check_access(
     // ── 2. Allow-list rules ───────────────────────────────────────────────
     if config.security.require_signature_check && !requester.signature_valid {
         return AccessDecision::Deny {
-            reason: format!(
-                "signature_invalid: {}",
-                requester.exe_path.display()
-            ),
+            reason: format!("signature_invalid: {}", requester.exe_path.display()),
         };
     }
 
@@ -149,7 +146,8 @@ fn resolve_dir(dir: &str, project_root: &Path) -> PathBuf {
 
 fn paths_match(a: &Path, b: &Path) -> bool {
     // Case-insensitive on Windows.
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -190,11 +188,11 @@ mod tests {
                 require_signature_check: false,
                 require_parent_check: true,
                 require_working_dir_check: false,
+                allow_cli_reveal: false,
             },
-            allow_list: AllowListConfig {
-                rules: extra_rules,
-            },
+            allow_list: AllowListConfig { rules: extra_rules },
             deny_list: DenyListConfig::default(),
+            process_rules: vec![],
         }
     }
 
@@ -231,7 +229,10 @@ mod tests {
         let chain = vec![make_process("uvicorn.exe", true)];
         let cfg = make_config(vec![uvicorn_rule()]);
         let result = check_access(&chain, "DB_URL", &cfg, Path::new(r"C:\projects\myapp"));
-        assert!(result.is_allowed(), "uvicorn should be allowed; got: {result:?}");
+        assert!(
+            result.is_allowed(),
+            "uvicorn should be allowed; got: {result:?}"
+        );
     }
 
     #[test]

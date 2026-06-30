@@ -1,5 +1,8 @@
 pub mod add;
+pub mod config;
+pub mod doctor;
 pub mod export;
+pub mod get;
 pub mod import;
 pub mod init;
 pub mod list;
@@ -8,3 +11,4 @@ pub mod log;
 pub mod run;
 pub mod status;
 pub mod unlock;
+pub mod verify;

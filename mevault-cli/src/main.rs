@@ -1,8 +1,8 @@
 mod commands;
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
@@ -19,6 +19,14 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Validate the current mevault.toml for errors
+    Validate,
+    /// Migrate legacy allow-list rules to [[process]] format
+    Migrate,
 }
 
 #[derive(Subcommand)]
@@ -39,6 +47,13 @@ enum Commands {
 
     /// Show current session and proxy status
     Status,
+
+    /// Run system diagnostics: project config, vault, session, proxy, updater
+    Doctor {
+        /// Simulate a launch: show whether this command would be allowed
+        #[arg(long, num_args = 1.., value_name = "ARGS")]
+        command: Option<Vec<String>>,
+    },
 
     /// Run a command with MeVault secrets available via the proxy
     Run {
@@ -112,10 +127,34 @@ enum Commands {
         #[arg(long)]
         vault: Option<String>,
     },
+
+    /// Verify a stored secret matches an expected value without revealing it
+    Verify {
+        /// Secret name to verify
+        name: String,
+        /// Compare against file contents instead of interactive input
+        #[arg(long = "from-file", value_name = "FILE")]
+        from_file: Option<PathBuf>,
+    },
+
+    /// Retrieve a secret value (requires explicit --reveal flag)
+    Get {
+        /// Secret name
+        name: String,
+        /// Display the value in the terminal (requires allow_cli_reveal = true in config)
+        #[arg(long)]
+        reveal: bool,
+    },
+
+    /// Validate or migrate mevault.toml project configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -127,36 +166,105 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { name, vault_dir } => {
-            commands::init::run(name, vault_dir)?;
+            if let Err(e) = commands::init::run(name, vault_dir) {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
         Commands::Unlock => {
-            commands::unlock::run().await?;
+            if let Err(e) = commands::unlock::run().await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
         Commands::Lock => {
-            commands::lock::run().await?;
+            if let Err(e) = commands::lock::run().await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
         Commands::Status => {
-            commands::status::run().await?;
+            if let Err(e) = commands::status::run().await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
-        Commands::Run { program, args, inject_env } => {
-            commands::run::run(&program, &args, inject_env).await?;
+        Commands::Doctor { command } => {
+            if let Err(e) = commands::doctor::run(command).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
-        Commands::Add { name, from_env, generate } => {
-            commands::add::run(name, from_env, generate).await?;
+        Commands::Run {
+            program,
+            args,
+            inject_env,
+        } => {
+            if let Err(e) = commands::run::run(&program, &args, inject_env).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Commands::Add {
+            name,
+            from_env,
+            generate,
+        } => {
+            if let Err(e) = commands::add::run(name, from_env, generate).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
         Commands::List { vault } => {
-            commands::list::run(vault)?;
+            if let Err(e) = commands::list::run(vault).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
-        Commands::Log { tail, event_type, secret, since, export } => {
-            commands::log::run(tail, event_type, secret, since, export).await?;
+        Commands::Log {
+            tail,
+            event_type,
+            secret,
+            since,
+            export,
+        } => {
+            if let Err(e) = commands::log::run(tail, event_type, secret, since, export).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
-        Commands::Export { format, output, vault } => {
-            commands::export::run(&format, output, vault).await?;
+        Commands::Export {
+            format,
+            output,
+            vault,
+        } => {
+            if let Err(e) = commands::export::run(&format, output, vault).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
         Commands::Import { file, vault } => {
-            commands::import::run(file, vault).await?;
+            if let Err(e) = commands::import::run(file, vault).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Commands::Verify { name, from_file } => {
+            return commands::verify::run(name, from_file);
+        }
+        Commands::Get { name, reveal } => {
+            if let Err(e) = commands::get::run(name, reveal).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Commands::Config { action } => {
+            if let Err(e) = commands::config::run(action).await {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 
-    Ok(())
+    ExitCode::SUCCESS
 }

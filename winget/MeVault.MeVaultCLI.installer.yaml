@@ -1,13 +1,13 @@
 PackageIdentifier: MeVault.MeVaultCLI
-PackageVersion: 0.1.0
+PackageVersion: 0.3.0
 InstallerType: portable
 Platform:
   - Windows.Desktop
 MinimumOSVersion: "10.0.0.0"
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/thecalebyte/mevault-cli/releases/download/v0.1.0/mevault-windows-x64.exe
-    InstallerSha256: REPLACE_WITH_SHA256_FROM_RELEASE
+    InstallerUrl: https://github.com/thecalebyte/mevault-cli/releases/download/cli-v0.3.0/mevault-windows-x64.exe
+    InstallerSha256: ADD99F0663A2990F3927FB6CF55C32D9783E044A3BC488467939B6022EA217C7
     InstallerType: portable
 Commands:
   - mevault

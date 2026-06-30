@@ -5,7 +5,7 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::HANDLE;
@@ -15,10 +15,10 @@ use crate::{
     allowlist,
     audit::{AuditEvent, AuditLog, EventType},
     config::ProjectConfig,
-    identity,
+    grants, identity,
     session::SharedSession,
 };
-pub use protocol::{ControlRequest, ControlResponse, IpcRequest, IpcResponse};
+pub use protocol::{ControlRequest, ControlResponse, IpcRequest, IpcResponse, Operation};
 
 /// Secret-request pipe: any process may connect; identity is the gate.
 pub const RUNTIME_PIPE: &str = r"\\.\pipe\mevault-runtime";
@@ -29,6 +29,24 @@ pub const CONTROL_PIPE: &str = r"\\.\pipe\mevault-control";
 
 /// Exes allowed to connect to the control pipe.
 const MANAGEMENT_EXES: &[&str] = &["mevault.exe", "mevault-app.exe"];
+
+/// Maximum bytes accepted per request line. Requests larger than this are
+/// dropped without a response to avoid memory exhaustion from malicious clients.
+const MAX_REQUEST_BYTES: usize = 4096;
+
+/// Maximum bytes written in a single response. Responses larger than this
+/// indicate a bug (e.g., a secret value that is unreasonably large); the
+/// connection is closed to avoid silently truncating data.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Per-connection read deadline in seconds. Connections that send no data
+/// within this window are closed so a stalled client cannot hold a pipe slot.
+const READ_TIMEOUT_SECS: u64 = 10;
+
+fn request_payload_len(line: &str) -> usize {
+    let without_lf = line.strip_suffix('\n').unwrap_or(line);
+    without_lf.strip_suffix('\r').unwrap_or(without_lf).len()
+}
 
 /// Run the named-pipe runtime server until `shutdown` resolves.
 ///
@@ -101,22 +119,90 @@ async fn handle_client(
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
-    while reader.read_line(&mut line).await.context("pipe read")? > 0 {
+    loop {
+        line.clear();
+
+        // Apply per-connection read timeout so a stalled client cannot hold
+        // a pipe slot indefinitely.
+        // Limit the read itself, not just the later JSON parse. Reading an
+        // unbounded line before checking its size would still let a client
+        // force an arbitrarily large allocation. The extra three bytes let us
+        // observe one byte beyond the limit plus a possible CRLF terminator.
+        let mut limited = (&mut reader).take((MAX_REQUEST_BYTES + 3) as u64);
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+            limited.read_line(&mut line),
+        )
+        .await
+        .unwrap_or(Ok(0)) // treat timeout as EOF
+        .context("pipe read")?;
+
+        if n == 0 {
+            break;
+        }
+
+        // 8b: reject oversized requests before trimming or parsing. Framing
+        // bytes (LF or CRLF) do not count toward the request payload limit.
+        let payload_len = request_payload_len(&line);
+        if payload_len > MAX_REQUEST_BYTES {
+            tracing::warn!(
+                "oversized request ({} bytes) from pid {} — dropping connection",
+                payload_len,
+                pid
+            );
+            return Ok(());
+        }
+
         let trimmed = line.trim();
-        let response = if trimmed.is_empty() {
-            line.clear();
+        if trimmed.is_empty() {
             continue;
-        } else {
-            match serde_json::from_str::<IpcRequest>(trimmed) {
-                Ok(req) => dispatch(&req, &grant, &session, &audit, &config).await,
-                Err(_) => IpcResponse::err("invalid_request", None),
+        }
+
+        // 8c: validate JSON and dispatch.
+        let response = match serde_json::from_str::<IpcRequest>(trimmed) {
+            Ok(req) => {
+                let request_id = req.request_id;
+                // 8a: reject unsupported protocol versions.
+                if req.protocol_version > 1 {
+                    IpcResponse::err(
+                        "protocol_version_unsupported",
+                        Some("server supports version 1".to_owned()),
+                    )
+                    .with_request_id(request_id)
+                } else {
+                    dispatch(&req, &grant, &session, &audit, &config)
+                        .await
+                        .with_request_id(request_id)
+                }
+            }
+            // 8c: malformed JSON
+            Err(_) => IpcResponse::err("invalid_request", Some("malformed JSON".to_owned())),
+        };
+
+        let encoded = match serde_json::to_string(&response) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to serialize IPC response: {e}");
+                return Ok(());
             }
         };
 
-        let mut encoded = serde_json::to_string(&response).unwrap_or_default();
-        encoded.push('\n');
-        writer.write_all(encoded.as_bytes()).await.context("pipe write")?;
-        line.clear();
+        // Guard against unexpectedly large responses.
+        if encoded.len() + 1 > MAX_RESPONSE_BYTES {
+            tracing::warn!(
+                "response too large ({} bytes) for pid {} — dropping connection",
+                encoded.len(),
+                pid
+            );
+            return Ok(());
+        }
+
+        let mut framed = encoded;
+        framed.push('\n');
+        writer
+            .write_all(framed.as_bytes())
+            .await
+            .context("pipe write")?;
     }
 
     Ok(())
@@ -138,25 +224,32 @@ async fn dispatch(
             "grant verification failed for PID {} — process identity changed",
             grant.pid
         );
-        return IpcResponse::err("grant_invalid", Some("process identity changed since connection".to_owned()));
+        return IpcResponse::err(
+            "grant_invalid",
+            Some("process identity changed since connection".to_owned()),
+        );
     }
 
     let pid = grant.pid;
 
-    match req {
-        IpcRequest::ListSecrets => {
+    match &req.operation {
+        Operation::ListSecrets => {
             let lock = session.read().await;
             let sess = match lock.as_ref() {
                 Some(s) if s.is_active() => s,
                 Some(_) => return IpcResponse::err("session_expired", None),
-                None    => return IpcResponse::err("vault_locked", None),
+                None => return IpcResponse::err("vault_locked", None),
             };
             if config.security.require_identity_check {
                 match identity::build_process_chain(pid) {
                     Ok(chain) => {
-                        let decision = allowlist::check_access(&chain, "", config, &sess.project_root);
+                        let decision =
+                            allowlist::check_access(&chain, "", config, &sess.project_root);
                         if !decision.is_allowed() {
-                            return IpcResponse::err("access_denied", Some(decision.reason().to_owned()));
+                            return IpcResponse::err(
+                                "access_denied",
+                                Some(decision.reason().to_owned()),
+                            );
                         }
                     }
                     Err(e) => {
@@ -169,20 +262,67 @@ async fn dispatch(
             // lock released here
         }
 
-        IpcRequest::GetSecret { name } => {
+        Operation::GetSecret { name } => {
+            // Look up the grant by (pid, process_created_at) so that a process
+            // that recycled the same PID cannot inherit another process's grant.
+            // The creation timestamp is obtained from the kernel — it cannot be
+            // forged by the client.
+            let grant_key = get_process_creation_time(pid).map(|t| (pid, t));
+            if let Some((grant_pid, grant_ts)) = grant_key {
+                if let Some(launch_grant) = grants::global().get(grant_pid, grant_ts) {
+                    if !launch_grant.allows_secret(name) {
+                        return IpcResponse::err(
+                            "access_denied",
+                            Some(format!("secret '{}' not in process grant", name)),
+                        );
+                    }
+                    // Grant is authoritative -- skip the regular identity/allow-list
+                    // checks and proceed directly to vault retrieval.
+                    let (vault, vault_name, session_id) = {
+                        let lock = session.read().await;
+                        let sess = match lock.as_ref() {
+                            Some(s) if s.is_active() => s,
+                            Some(_) => return IpcResponse::err("session_expired", None),
+                            None => return IpcResponse::err("vault_locked", None),
+                        };
+                        (sess.vault(), sess.vault_name.clone(), sess.id.to_string())
+                    };
+
+                    let name_clone = name.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || vault.get_secret(&name_clone)).await;
+                    return match result {
+                        Ok(Ok(secret)) => {
+                            use secrecy::ExposeSecret;
+                            write_audit(
+                                audit,
+                                AuditEvent::new(EventType::Allowed)
+                                    .secret(name)
+                                    .vault(&vault_name)
+                                    .session(session_id),
+                            );
+                            IpcResponse::value(secret.expose_secret().to_owned())
+                        }
+                        Ok(Err(_)) => IpcResponse::err("secret_not_found", Some(name.clone())),
+                        Err(_) => IpcResponse::err("internal_error", None),
+                    };
+                }
+            }
+
             // Scope the lock narrowly: clone Arc<UnlockedVault>, then drop lock.
             let (allowed, deny_reason, vault, vault_name, session_id) = {
                 let lock = session.read().await;
                 let sess = match lock.as_ref() {
                     Some(s) if s.is_active() => s,
                     Some(_) => return IpcResponse::err("session_expired", None),
-                    None    => return IpcResponse::err("vault_locked", None),
+                    None => return IpcResponse::err("vault_locked", None),
                 };
 
                 let (allowed, deny_reason) = if config.security.require_identity_check {
                     match identity::build_process_chain(pid) {
                         Ok(chain) => {
-                            let dec = allowlist::check_access(&chain, name, config, &sess.project_root);
+                            let dec =
+                                allowlist::check_access(&chain, name, config, &sess.project_root);
                             if dec.is_allowed() {
                                 (true, None)
                             } else {
@@ -201,7 +341,7 @@ async fn dispatch(
                 (
                     allowed,
                     deny_reason,
-                    sess.vault(),        // Arc<UnlockedVault> — cheap clone
+                    sess.vault(), // Arc<UnlockedVault> — cheap clone
                     sess.vault_name.clone(),
                     sess.id.to_string(),
                 )
@@ -225,11 +365,9 @@ async fn dispatch(
             }
 
             // Use DEK from the unlocked vault — no Argon2, just AES-256-GCM.
+            // 8d: name is logged but value is never logged anywhere.
             let name_clone = name.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                vault.get_secret(&name_clone)
-            })
-            .await;
+            let result = tokio::task::spawn_blocking(move || vault.get_secret(&name_clone)).await;
 
             match result {
                 Ok(Ok(secret)) => {
@@ -259,10 +397,43 @@ fn client_pid(pipe: &NamedPipeServer) -> Result<u32> {
     let handle = HANDLE(pipe.as_raw_handle());
     let mut pid = 0u32;
     unsafe {
-        GetNamedPipeClientProcessId(handle, &mut pid)
-            .context("GetNamedPipeClientProcessId")?;
+        GetNamedPipeClientProcessId(handle, &mut pid).context("GetNamedPipeClientProcessId")?;
     }
     Ok(pid)
+}
+
+/// Open the process at `pid` and return its creation timestamp as a 64-bit
+/// FILETIME value (100-nanosecond intervals since 1601-01-01).
+/// Returns `None` if the process cannot be opened or has already exited.
+#[cfg(windows)]
+fn get_process_creation_time(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut ct = FILETIME::default();
+        let mut et = FILETIME::default();
+        let mut kt = FILETIME::default();
+        let mut ut = FILETIME::default();
+        let ok = GetProcessTimes(h, &mut ct, &mut et, &mut kt, &mut ut).is_ok();
+        CloseHandle(h).ok();
+        if !ok {
+            return None;
+        }
+        let t = ((ct.dwHighDateTime as u64) << 32) | ct.dwLowDateTime as u64;
+        if t == 0 {
+            None
+        } else {
+            Some(t)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn get_process_creation_time(_pid: u32) -> Option<u64> {
+    None
 }
 
 fn write_audit(audit: &Arc<AuditLog>, event: AuditEvent) {
@@ -287,7 +458,14 @@ pub async fn run_control_server(
     shutdown_trigger: mpsc::Sender<()>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    run_control_server_on(CONTROL_PIPE, MANAGEMENT_EXES, session, shutdown_trigger, shutdown).await
+    run_control_server_on(
+        CONTROL_PIPE,
+        MANAGEMENT_EXES,
+        session,
+        shutdown_trigger,
+        shutdown,
+    )
+    .await
 }
 
 /// Internal: start the control server on an arbitrary pipe name and exe allow-list.
@@ -351,7 +529,7 @@ async fn handle_control_client(
     session: SharedSession,
     shutdown_trigger: mpsc::Sender<()>,
 ) -> Result<()> {
-    let pid   = client_pid(&pipe).context("GetNamedPipeClientProcessId")?;
+    let pid = client_pid(&pipe).context("GetNamedPipeClientProcessId")?;
     let grant = identity::record_grant(pid).context("recording control grant")?;
 
     if !is_management_exe(&grant.exe_path, allowed_exes) {
@@ -365,9 +543,14 @@ async fn handle_control_client(
 
     let (reader, mut writer) = tokio::io::split(pipe);
     let mut reader = BufReader::new(reader);
-    let mut line   = String::new();
+    let mut line = String::new();
 
-    while reader.read_line(&mut line).await.context("control pipe read")? > 0 {
+    while reader
+        .read_line(&mut line)
+        .await
+        .context("control pipe read")?
+        > 0
+    {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             line.clear();
@@ -381,7 +564,7 @@ async fn handle_control_client(
                 let lock = session.read().await;
                 match lock.as_ref() {
                     Some(s) => ControlResponse::status(Some(s.vault_name.clone()), s.is_active()),
-                    None    => ControlResponse::status(None, false),
+                    None => ControlResponse::status(None, false),
                 }
             }
 
@@ -393,7 +576,10 @@ async fn handle_control_client(
         };
 
         let encoded = format!("{}\n", serde_json::to_string(&response).unwrap_or_default());
-        writer.write_all(encoded.as_bytes()).await.context("control pipe write")?;
+        writer
+            .write_all(encoded.as_bytes())
+            .await
+            .context("control pipe write")?;
         line.clear();
     }
 
@@ -412,11 +598,20 @@ pub async fn send_control(req: &ControlRequest) -> Result<ControlResponse> {
     let (reader, mut writer) = tokio::io::split(pipe);
     let mut reader = BufReader::new(reader);
 
-    let encoded = format!("{}\n", serde_json::to_string(req).context("encoding control request")?);
-    writer.write_all(encoded.as_bytes()).await.context("sending control request")?;
+    let encoded = format!(
+        "{}\n",
+        serde_json::to_string(req).context("encoding control request")?
+    );
+    writer
+        .write_all(encoded.as_bytes())
+        .await
+        .context("sending control request")?;
 
     let mut line = String::new();
-    reader.read_line(&mut line).await.context("reading control response")?;
+    reader
+        .read_line(&mut line)
+        .await
+        .context("reading control response")?;
 
     serde_json::from_str::<ControlResponse>(line.trim()).context("parsing control response")
 }
@@ -465,6 +660,64 @@ mod tests {
         assert!(back.active.is_none());
     }
 
+    // ── Unit tests: IPC request serde (backward compat) ───────────────────────
+
+    #[test]
+    fn ipc_request_legacy_sdk_get_secret_deserializes() {
+        // SDK sends: {"op":"get_secret","name":"DB_URL"}
+        // Must parse without protocol_version or request_id.
+        let json = r#"{"op":"get_secret","name":"DB_URL"}"#;
+        let req: IpcRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.protocol_version, 1);
+        assert!(req.request_id.is_none());
+        assert!(matches!(req.operation, Operation::GetSecret { name } if name == "DB_URL"));
+    }
+
+    #[test]
+    fn ipc_request_legacy_sdk_list_secrets_deserializes() {
+        let json = r#"{"op":"list_secrets"}"#;
+        let req: IpcRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.protocol_version, 1);
+        assert!(req.request_id.is_none());
+        assert!(matches!(req.operation, Operation::ListSecrets));
+    }
+
+    #[test]
+    fn ipc_request_with_version_and_id_deserializes() {
+        let id = uuid::Uuid::new_v4();
+        let json =
+            format!(r#"{{"op":"get_secret","name":"X","protocol_version":1,"request_id":"{id}"}}"#);
+        let req: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.protocol_version, 1);
+        assert_eq!(req.request_id, Some(id));
+        assert!(matches!(req.operation, Operation::GetSecret { name } if name == "X"));
+    }
+
+    #[test]
+    fn ipc_response_propagates_request_id() {
+        let id = uuid::Uuid::new_v4();
+        let resp = IpcResponse::err("vault_locked", None).with_request_id(Some(id));
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["request_id"].as_str().unwrap(), id.to_string());
+    }
+
+    #[test]
+    fn ipc_response_omits_request_id_when_none() {
+        let resp = IpcResponse::err("vault_locked", None);
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("request_id").is_none());
+    }
+
+    #[test]
+    fn request_size_excludes_only_line_framing() {
+        assert_eq!(request_payload_len("abc\n"), 3);
+        assert_eq!(request_payload_len("abc\r\n"), 3);
+        assert_eq!(request_payload_len(" abc \n"), 5);
+        assert_eq!(request_payload_len("abc"), 3);
+    }
+
     // ── Unit tests: management exe allow-list ─────────────────────────────────
 
     #[test]
@@ -473,7 +726,10 @@ mod tests {
         let allowed = &["mevault.exe", "mevault-app.exe"];
         assert!(is_management_exe(Path::new("mevault.exe"), allowed));
         assert!(is_management_exe(Path::new("MEVAULT.EXE"), allowed));
-        assert!(is_management_exe(Path::new(r"C:\Program Files\MeVault\mevault.exe"), allowed));
+        assert!(is_management_exe(
+            Path::new(r"C:\Program Files\MeVault\mevault.exe"),
+            allowed
+        ));
         assert!(is_management_exe(Path::new("mevault-app.exe"), allowed));
     }
 
@@ -522,7 +778,9 @@ mod tests {
             MANAGEMENT_EXES,
             Arc::clone(&session),
             kill_tx,
-            async move { let _ = done_rx.await; },
+            async move {
+                let _ = done_rx.await;
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -537,9 +795,12 @@ mod tests {
     async fn control_pipe_status_locked_vault() {
         // Allow the test binary so we can test the actual Status dispatch.
         let test_exe_name: &'static str = Box::leak(
-            std::env::current_exe().unwrap()
-                .file_name().unwrap()
-                .to_str().unwrap()
+            std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
                 .to_string()
                 .into_boxed_str(),
         );
@@ -556,7 +817,9 @@ mod tests {
             allowed,
             Arc::clone(&session),
             kill_tx,
-            async move { let _ = done_rx.await; },
+            async move {
+                let _ = done_rx.await;
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -571,9 +834,12 @@ mod tests {
     #[tokio::test]
     async fn control_pipe_lock_fires_shutdown_trigger() {
         let test_exe_name: &'static str = Box::leak(
-            std::env::current_exe().unwrap()
-                .file_name().unwrap()
-                .to_str().unwrap()
+            std::env::current_exe()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
                 .to_string()
                 .into_boxed_str(),
         );
@@ -590,7 +856,9 @@ mod tests {
             allowed,
             Arc::clone(&session),
             kill_tx,
-            async move { let _ = done_rx.await; },
+            async move {
+                let _ = done_rx.await;
+            },
         ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -600,12 +868,12 @@ mod tests {
         assert!(resp.error.is_none());
 
         // The shutdown trigger must have fired within a reasonable time.
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            kill_rx.recv(),
-        )
-        .await;
-        assert!(received.is_ok(), "shutdown_trigger was not fired by Lock command");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), kill_rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "shutdown_trigger was not fired by Lock command"
+        );
 
         let _ = done_tx.send(());
     }

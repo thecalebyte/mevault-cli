@@ -7,11 +7,7 @@ use mevault_core::{
 use secrecy::SecretString;
 use std::path::PathBuf;
 
-pub async fn run(
-    name: Option<String>,
-    from_env: Option<PathBuf>,
-    generate: bool,
-) -> Result<()> {
+pub async fn run(name: Option<String>, from_env: Option<PathBuf>, generate: bool) -> Result<()> {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg = ProjectConfig::load(&project_root)
         .context("no mevault.toml found — run `mevault init` first")?;
@@ -22,8 +18,14 @@ pub async fn run(
     let bridge = SecretStoreBridge::new();
 
     if let Some(env_path) = from_env {
-        import_from_dotenv(&env_path, &cfg.project.vault_name, &bridge, Some(&password), &audit)
-            .await?;
+        import_from_dotenv(
+            &env_path,
+            &cfg.project.vault_name,
+            &bridge,
+            Some(&password),
+            &audit,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -48,13 +50,17 @@ pub async fn run(
     } else {
         SecretString::new(
             rpassword::prompt_password(format!("Value for '{secret_name}': "))
-                .context("reading secret value")?
-                .into(),
+                .context("reading secret value")?,
         )
     };
 
     bridge
-        .set_secret(&secret_name, &value, &cfg.project.vault_name, Some(&password))
+        .set_secret(
+            &secret_name,
+            &value,
+            &cfg.project.vault_name,
+            Some(&password),
+        )
         .with_context(|| format!("storing '{secret_name}'"))?;
 
     audit
@@ -65,7 +71,10 @@ pub async fn run(
         )
         .await?;
 
-    println!("Secret '{secret_name}' added to vault '{}'.", cfg.project.vault_name);
+    println!(
+        "Secret '{secret_name}' added to vault '{}'.",
+        cfg.project.vault_name
+    );
     Ok(())
 }
 
@@ -76,8 +85,8 @@ async fn import_from_dotenv(
     password: Option<&SecretString>,
     audit: &AuditLog,
 ) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     // Collect all entries first so we only prompt for the vault password once.
     let entries: Vec<(String, String)> = content
@@ -103,7 +112,7 @@ async fn import_from_dotenv(
     let pw = password.context("vault password is required")?;
     let secrets_map: std::collections::HashMap<String, SecretString> = entries
         .iter()
-        .map(|(k, v)| (k.clone(), SecretString::new(v.clone().into())))
+        .map(|(k, v)| (k.clone(), SecretString::new(v.clone())))
         .collect();
 
     bridge
@@ -136,7 +145,7 @@ fn generate_secret() -> SecretString {
     let s: String = (0..40)
         .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
         .collect();
-    SecretString::new(s.into())
+    SecretString::new(s)
 }
 
 pub fn prompt_vault_password() -> Result<SecretString> {
@@ -144,7 +153,7 @@ pub fn prompt_vault_password() -> Result<SecretString> {
     if pw.is_empty() {
         bail!("Password cannot be empty");
     }
-    Ok(SecretString::new(pw.into()))
+    Ok(SecretString::new(pw))
 }
 
 async fn open_audit() -> Result<AuditLog> {

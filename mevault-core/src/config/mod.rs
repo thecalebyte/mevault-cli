@@ -5,6 +5,67 @@ use std::path::{Path, PathBuf};
 // ── Project config (mevault.toml in project root) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRule {
+    pub name: String,
+    /// Path to executable. Supports ${PROJECT_ROOT} variable.
+    pub executable: String,
+    /// Expected working directory. Supports ${PROJECT_ROOT}.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Expected command arguments (after the executable).
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// If true, only allow access when launched via `mevault run` (in a Job Object).
+    #[serde(default = "bool_true")]
+    pub launch_only: bool,
+    /// Whether to require the executable to be signed.
+    #[serde(default)]
+    pub signed: bool,
+    /// Explicit list of secrets this process may access. Empty = no access.
+    pub secrets: Vec<String>,
+    /// Explicit opt-in required when `secrets` contains `"*"`.
+    /// Without this flag, a wildcard entry is treated as a misconfiguration and
+    /// grants *no* access (fail-closed). Set to `true` only when you genuinely
+    /// want to allow the process to access every secret in the vault.
+    #[serde(default)]
+    pub allow_all_secrets: bool,
+}
+
+impl ProcessRule {
+    pub fn resolve_paths(&self, project_root: &std::path::Path) -> ProcessRule {
+        let root = project_root.to_string_lossy();
+        let resolve = |s: &str| s.replace("${PROJECT_ROOT}", &root);
+        ProcessRule {
+            name: self.name.clone(),
+            executable: resolve(&self.executable),
+            working_dir: self.working_dir.as_deref().map(resolve),
+            command: self.command.clone(),
+            launch_only: self.launch_only,
+            signed: self.signed,
+            secrets: self.secrets.clone(),
+            allow_all_secrets: self.allow_all_secrets,
+        }
+    }
+
+    /// Check if this rule permits access to `secret_name`.
+    ///
+    /// Wildcard access (`secrets = ["*"]`) requires explicit double opt-in via
+    /// `allow_all_secrets = true`. Without it the wildcard is treated as a
+    /// misconfiguration and the rule grants *no* access (fail-closed).
+    pub fn allows_secret(&self, secret_name: &str) -> bool {
+        if self.secrets.iter().any(|s| s == "*") {
+            // Wildcard requires explicit double opt-in.
+            if !self.allow_all_secrets {
+                return false;
+            }
+            return true;
+        }
+        self.secrets.iter().any(|s| s == secret_name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub project: ProjectMeta,
     pub session: SessionConfig,
@@ -13,6 +74,8 @@ pub struct ProjectConfig {
     pub allow_list: AllowListConfig,
     #[serde(default)]
     pub deny_list: DenyListConfig,
+    #[serde(default, rename = "process")]
+    pub process_rules: Vec<ProcessRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +122,10 @@ pub struct SecurityConfig {
     pub require_parent_check: bool,
     #[serde(default = "bool_true")]
     pub require_working_dir_check: bool,
+    /// Allow `mevault get --reveal` to display a secret value in the terminal.
+    /// Defaults to false; user must explicitly opt in by setting this to true.
+    #[serde(default)]
+    pub allow_cli_reveal: bool,
 }
 
 fn default_unknown_process_mode() -> UnknownProcessMode {
@@ -130,8 +197,7 @@ impl ProjectConfig {
     pub fn save(&self, project_root: &Path) -> Result<()> {
         let path = project_root.join("mevault.toml");
         let text = toml::to_string_pretty(self).context("serializing project config")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing {}", path.display()))
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn new(name: impl Into<String>, vault_name: impl Into<String>) -> Self {
@@ -151,11 +217,13 @@ impl ProjectConfig {
                 require_signature_check: true,
                 require_parent_check: true,
                 require_working_dir_check: true,
+                allow_cli_reveal: false,
             },
             allow_list: AllowListConfig {
                 rules: default_allow_rules(),
             },
             deny_list: DenyListConfig::default(),
+            process_rules: vec![],
         }
     }
 }
@@ -212,8 +280,8 @@ impl SystemPolicy {
     /// Load from `%ProgramData%\MeVault\policy.toml`.
     /// Returns a default (all-None, empty) policy if the file is absent or unreadable.
     pub fn load() -> Self {
-        let program_data = std::env::var("ProgramData")
-            .unwrap_or_else(|_| r"C:\ProgramData".to_owned());
+        let program_data =
+            std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_owned());
         let path = std::path::PathBuf::from(program_data)
             .join("MeVault")
             .join("policy.toml");
@@ -352,8 +420,7 @@ impl AppConfig {
             std::fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self).context("serializing app config")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("writing {}", path.display()))
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -405,5 +472,75 @@ mod tests {
         let parsed: AppConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.proxy.port, 52731);
         assert_eq!(parsed.proxy.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn allows_secret_exact_match() {
+        let rule = ProcessRule {
+            name: "myapp".into(),
+            executable: "myapp.exe".into(),
+            working_dir: None,
+            command: vec![],
+            launch_only: true,
+            signed: false,
+            secrets: vec!["DB_URL".into(), "API_KEY".into()],
+            allow_all_secrets: false,
+        };
+        assert!(rule.allows_secret("DB_URL"));
+        assert!(rule.allows_secret("API_KEY"));
+        assert!(!rule.allows_secret("STRIPE_KEY"));
+    }
+
+    #[test]
+    fn allows_secret_wildcard_requires_double_optin() {
+        // Wildcard without allow_all_secrets: deny (fail-closed)
+        let rule_no_optin = ProcessRule {
+            name: "myapp".into(),
+            executable: "myapp.exe".into(),
+            working_dir: None,
+            command: vec![],
+            launch_only: true,
+            signed: false,
+            secrets: vec!["*".into()],
+            allow_all_secrets: false,
+        };
+        assert!(
+            !rule_no_optin.allows_secret("DB_URL"),
+            "wildcard without allow_all_secrets must deny"
+        );
+        assert!(
+            !rule_no_optin.allows_secret("anything"),
+            "wildcard without allow_all_secrets must deny"
+        );
+
+        // Wildcard WITH allow_all_secrets: allow
+        let rule_optin = ProcessRule {
+            allow_all_secrets: true,
+            ..rule_no_optin
+        };
+        assert!(
+            rule_optin.allows_secret("DB_URL"),
+            "wildcard with allow_all_secrets must allow"
+        );
+        assert!(
+            rule_optin.allows_secret("anything"),
+            "wildcard with allow_all_secrets must allow"
+        );
+    }
+
+    #[test]
+    fn process_rule_deny_unknown_fields() {
+        // Valid TOML with unknown field should fail to parse.
+        let toml = r#"
+name = "myapp"
+executable = "myapp.exe"
+secrets = ["DB_URL"]
+unknown_field = "bad"
+"#;
+        let result: Result<ProcessRule, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields should reject unknown keys"
+        );
     }
 }

@@ -9,7 +9,11 @@ use std::path::PathBuf;
 
 use crate::commands::add::prompt_vault_password;
 
-pub async fn run(format: &str, output: Option<PathBuf>, vault_override: Option<String>) -> Result<()> {
+pub async fn run(
+    format: &str,
+    output: Option<PathBuf>,
+    vault_override: Option<String>,
+) -> Result<()> {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cfg = ProjectConfig::load(&project_root)
         .context("no mevault.toml found — run `mevault init` first")?;
@@ -18,7 +22,7 @@ pub async fn run(format: &str, output: Option<PathBuf>, vault_override: Option<S
 
     let default_ext = match format {
         "mvx" => ".mvx",
-        "encrypt" | _ => ".env.mvenc",
+        _ => ".env.mvenc",
     };
     let out_path = output.unwrap_or_else(|| PathBuf::from(format!("{vault_name}{default_ext}")));
 
@@ -51,10 +55,9 @@ pub async fn run(format: &str, output: Option<PathBuf>, vault_override: Option<S
     let count = match format {
         "mvx" => {
             let enc_pw = prompt_export_password()?;
-            export_mvx(&entries, &out_path, vault_name, &enc_pw)
-                .context("exporting mvx bundle")?
+            export_mvx(&entries, &out_path, vault_name, &enc_pw).context("exporting mvx bundle")?
         }
-        "encrypt" | _ => {
+        _ => {
             let enc_pw = prompt_export_password()?;
             export_encrypted_env(&entries, &out_path, vault_name, &enc_pw)
                 .context("exporting encrypted env")?
@@ -96,5 +99,5 @@ fn prompt_export_password() -> Result<SecretString> {
     if pw != confirm {
         bail!("Passwords do not match");
     }
-    Ok(SecretString::new(pw.into()))
+    Ok(SecretString::new(pw))
 }

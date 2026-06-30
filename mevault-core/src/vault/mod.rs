@@ -14,22 +14,31 @@ struct SecretMap(HashMap<String, String>);
 
 impl SecretMap {
     fn into_secret_strings(mut self) -> HashMap<String, SecretString> {
-        self.0.drain().map(|(k, v)| (k, SecretString::new(v.into()))).collect()
+        self.0
+            .drain()
+            .map(|(k, v)| (k, SecretString::new(v)))
+            .collect()
     }
 }
 
 impl std::ops::Deref for SecretMap {
     type Target = HashMap<String, String>;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl std::ops::DerefMut for SecretMap {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl Drop for SecretMap {
     fn drop(&mut self) {
-        for v in self.0.values_mut() { v.zeroize(); }
+        for v in self.0.values_mut() {
+            v.zeroize();
+        }
     }
 }
 
@@ -79,6 +88,19 @@ pub struct SecretInfo {
     pub kind: String,
 }
 
+/// Metadata about a vault file read without decrypting the payload.
+/// Never contains secret values or the DEK.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VaultDiagnostic {
+    pub name: String,
+    pub vault_id: String,
+    pub format_version: String,
+    pub file_path: String,
+    pub payload_present: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// An unlocked vault session holding a cached Data-Encryption Key.
 ///
 /// All secret operations use the cached DEK — Argon2 is not run again after
@@ -94,15 +116,20 @@ pub struct UnlockedVault {
 }
 
 impl UnlockedVault {
-    pub fn vault_name(&self) -> &str { &self.vault_name }
-    pub fn vault_id(&self) -> &str { &self.vault_id }
+    pub fn vault_name(&self) -> &str {
+        &self.vault_name
+    }
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
 
     pub fn get_secret(&self, name: &str) -> Result<SecretString> {
         let path = self.vault_path()?;
         let vf = self.read_v2(&path)?;
         let secrets = self.decrypt_payload(&vf)?;
-        secrets.get(name)
-            .map(|v| SecretString::new(v.clone().into()))
+        secrets
+            .get(name)
+            .map(|v| SecretString::new(v.clone()))
             .with_context(|| format!("secret '{name}' not found in vault '{}'", self.vault_name))
     }
 
@@ -142,8 +169,12 @@ impl UnlockedVault {
         let path = self.vault_path()?;
         let vf = self.read_v2(&path)?;
         let secrets = self.decrypt_payload(&vf)?;
-        let mut infos: Vec<SecretInfo> = secrets.keys()
-            .map(|k| SecretInfo { name: k.clone(), kind: "String".to_owned() })
+        let mut infos: Vec<SecretInfo> = secrets
+            .keys()
+            .map(|k| SecretInfo {
+                name: k.clone(),
+                kind: "String".to_owned(),
+            })
             .collect();
         infos.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(infos)
@@ -181,10 +212,13 @@ impl UnlockedVault {
         std::fs::create_dir_all(&self.vault_dir).context("creating vault directory")?;
         let lock_path = self.vault_dir.join(format!("{safe}.lock"));
         let lock_file = std::fs::OpenOptions::new()
-            .create(true).write(true)
+            .create(true)
+            .truncate(false)
+            .write(true)
             .open(&lock_path)
             .with_context(|| format!("opening lock file for vault '{}'", self.vault_name))?;
-        lock_file.lock_exclusive()
+        lock_file
+            .lock_exclusive()
             .with_context(|| format!("acquiring lock for vault '{}'", self.vault_name))?;
         let result = f();
         let _ = lock_file.unlock();
@@ -203,7 +237,11 @@ impl UnlockedVault {
             bail!("UnlockedVault got a non-v2 file (version '{}')", vf.version);
         }
         if vf.name != self.vault_name {
-            bail!("vault name mismatch: file has '{}', expected '{}'", vf.name, self.vault_name);
+            bail!(
+                "vault name mismatch: file has '{}', expected '{}'",
+                vf.name,
+                self.vault_name
+            );
         }
         Ok(vf)
     }
@@ -216,12 +254,17 @@ impl UnlockedVault {
         let aad = self.payload_aad();
         let plaintext = crypto::decrypt_payload(&vf.payload_nonce, &vf.payload, &self.dek, &aad)
             .context("payload decryption failed")?;
-        let secrets: HashMap<String, String> = serde_json::from_slice(&plaintext)
-            .context("vault contents are corrupt")?;
+        let secrets: HashMap<String, String> =
+            serde_json::from_slice(&plaintext).context("vault contents are corrupt")?;
         Ok(SecretMap(secrets))
     }
 
-    fn encrypt_and_write(&self, vf: &mut VaultFileV2, path: &Path, secrets: &HashMap<String, String>) -> Result<()> {
+    fn encrypt_and_write(
+        &self,
+        vf: &mut VaultFileV2,
+        path: &Path,
+        secrets: &HashMap<String, String>,
+    ) -> Result<()> {
         let aad = self.payload_aad();
         let plaintext = Zeroizing::new(serde_json::to_vec(secrets).context("serialising secrets")?);
         let (nonce, ct) = crypto::encrypt_payload(&plaintext, &self.dek, &aad)
@@ -250,11 +293,17 @@ impl VaultStore {
         let vault_dir = std::env::var("APPDATA")
             .map(|a| PathBuf::from(a).join("MeVault").join("vaults"))
             .unwrap_or_else(|_| PathBuf::from(".mevault").join("vaults"));
-        Self { vault_dir, policy: CryptoPolicy::production() }
+        Self {
+            vault_dir,
+            policy: CryptoPolicy::production(),
+        }
     }
 
     pub fn new_at(vault_dir: PathBuf) -> Self {
-        Self { vault_dir, policy: CryptoPolicy::production() }
+        Self {
+            vault_dir,
+            policy: CryptoPolicy::production(),
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -288,13 +337,16 @@ impl VaultStore {
     pub fn unlock(&self, vault_name: &str, password: &SecretString) -> Result<UnlockedVault> {
         let path = self.vault_path(vault_name)?;
         if !path.exists() {
-            bail!("vault '{}' not found — run `mevault init` first", vault_name);
+            bail!(
+                "vault '{}' not found — run `mevault init` first",
+                vault_name
+            );
         }
 
         let raw_json = std::fs::read_to_string(&path)
             .with_context(|| format!("reading vault '{vault_name}'"))?;
-        let raw: serde_json::Value = serde_json::from_str(&raw_json)
-            .context("vault file is corrupt")?;
+        let raw: serde_json::Value =
+            serde_json::from_str(&raw_json).context("vault file is corrupt")?;
 
         match raw["version"].as_str().unwrap_or("1") {
             "2" => self.unlock_v2_from_json(&raw_json, vault_name, password),
@@ -343,7 +395,9 @@ impl VaultStore {
     }
 
     pub fn list_vaults(&self) -> Result<Vec<String>> {
-        if !self.vault_dir.exists() { return Ok(vec![]); }
+        if !self.vault_dir.exists() {
+            return Ok(vec![]);
+        }
         let mut names = vec![];
         for entry in std::fs::read_dir(&self.vault_dir).context("reading vault directory")? {
             let path = entry?.path();
@@ -389,7 +443,8 @@ impl VaultStore {
         vault_name: &str,
         password: &SecretString,
     ) -> Result<()> {
-        self.unlock(vault_name, password)?.set_secrets_bulk(new_secrets)
+        self.unlock(vault_name, password)?
+            .set_secrets_bulk(new_secrets)
     }
 
     pub fn get_secret(
@@ -421,7 +476,11 @@ impl VaultStore {
         self.unlock(vault_name, pw)?.list_secrets()
     }
 
-    pub fn unlock_and_list_names(&self, vault_name: &str, password: &SecretString) -> Result<Vec<String>> {
+    pub fn unlock_and_list_names(
+        &self,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<Vec<String>> {
         self.unlock(vault_name, password)?.secret_names()
     }
 
@@ -433,10 +492,61 @@ impl VaultStore {
         self.unlock(vault_name, password)?.unlock_and_preload()
     }
 
+    /// Read vault metadata without decrypting. Safe to call without a password.
+    /// Returns a structured error if the vault doesn't exist, is not valid JSON,
+    /// or has a format/version that cannot be parsed.
+    pub fn vault_diagnostic(&self, vault_name: &str) -> Result<VaultDiagnostic> {
+        let path = self.vault_path(vault_name)?;
+        if !path.exists() {
+            bail!(
+                "vault '{}' not found — run `mevault init` first",
+                vault_name
+            );
+        }
+        let json = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading vault file for '{vault_name}'"))?;
+        let raw: serde_json::Value = serde_json::from_str(&json)
+            .context("vault file is not valid JSON — file may be corrupt")?;
+        let version = raw["version"].as_str().unwrap_or("1").to_owned();
+        match version.as_str() {
+            "2" => {
+                let vf: VaultFileV2 = serde_json::from_str(&json)
+                    .context("vault v2 file is corrupt or in an incompatible format")?;
+                Ok(VaultDiagnostic {
+                    name: vf.name,
+                    vault_id: vf.vault_id,
+                    format_version: format!("v{}", vf.version),
+                    file_path: path.display().to_string(),
+                    payload_present: !vf.payload.is_empty(),
+                    created_at: vf.created_at,
+                    updated_at: vf.updated_at,
+                })
+            }
+            "1" => {
+                let vf: VaultFile = serde_json::from_str(&json)
+                    .context("vault v1 file is corrupt or in an incompatible format")?;
+                Ok(VaultDiagnostic {
+                    name: vf.name,
+                    vault_id: String::from("(v1 — no vault-id)"),
+                    format_version: "v1 (legacy — will migrate on next unlock)".to_owned(),
+                    file_path: path.display().to_string(),
+                    payload_present: true,
+                    created_at: vf.created_at,
+                    updated_at: vf.updated_at,
+                })
+            }
+            v => bail!("unsupported vault version '{v}' in file {}", path.display()),
+        }
+    }
+
     // ── Module stubs ───────────────────────────────────────────────────────
 
-    pub fn check_modules(&self) -> Result<bool> { Ok(true) }
-    pub fn install_modules(&self) -> Result<()> { Ok(()) }
+    pub fn check_modules(&self) -> Result<bool> {
+        Ok(true)
+    }
+    pub fn install_modules(&self) -> Result<()> {
+        Ok(())
+    }
 
     // ── Internal ───────────────────────────────────────────────────────────
 
@@ -454,10 +564,13 @@ impl VaultStore {
         std::fs::create_dir_all(&self.vault_dir).context("creating vault directory")?;
         let lock_path = self.vault_dir.join(format!("{safe}.lock"));
         let lock_file = std::fs::OpenOptions::new()
-            .create(true).write(true)
+            .create(true)
+            .truncate(false)
+            .write(true)
             .open(&lock_path)
             .with_context(|| format!("opening lock file for vault '{vault_name}'"))?;
-        lock_file.lock_exclusive()
+        lock_file
+            .lock_exclusive()
             .with_context(|| format!("acquiring lock for vault '{vault_name}'"))?;
         let result = f();
         let _ = lock_file.unlock();
@@ -466,7 +579,12 @@ impl VaultStore {
 
     // ── V2 helpers ─────────────────────────────────────────────────────────
 
-    fn create_v2_vault_file(&self, path: &Path, vault_name: &str, password: &SecretString) -> Result<()> {
+    fn create_v2_vault_file(
+        &self,
+        path: &Path,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<()> {
         let (vf, _dek) = self.build_new_v2(vault_name, password, None, HashMap::new())?;
         let json = serde_json::to_string_pretty(&vf).context("serialising vault file")?;
         atomic_write(path, json.as_bytes())
@@ -494,12 +612,13 @@ impl VaultStore {
         let kek_salt = crypto::new_kek_salt();
         let (mem, iters, para) = self.policy.kdf_profile.params();
 
-        let mut kek = crypto::derive_kek(password, kek_salt.as_str(), mem, iters, para, &self.policy)
-            .context("deriving key-encryption key")?;
+        let mut kek =
+            crypto::derive_kek(password, kek_salt.as_str(), mem, iters, para, &self.policy)
+                .context("deriving key-encryption key")?;
 
         let kek_aad = format!("mevault-kek\0{vault_id}\0{vault_name}").into_bytes();
-        let (kp_nonce, wrapped_dek) = crypto::wrap_dek(&dek, &kek, &kek_aad)
-            .context("wrapping data-encryption key")?;
+        let (kp_nonce, wrapped_dek) =
+            crypto::wrap_dek(&dek, &kek, &kek_aad).context("wrapping data-encryption key")?;
         kek.zeroize();
 
         let payload_aad = format!("mevault-payload\0{vault_id}\0{vault_name}").into_bytes();
@@ -529,22 +648,38 @@ impl VaultStore {
         Ok((vf, dek))
     }
 
-    fn unlock_v2_from_json(&self, json: &str, vault_name: &str, password: &SecretString) -> Result<UnlockedVault> {
-        let vf: VaultFileV2 = serde_json::from_str(json)
-            .context("parsing v2 vault file")?;
+    fn unlock_v2_from_json(
+        &self,
+        json: &str,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<UnlockedVault> {
+        let vf: VaultFileV2 = serde_json::from_str(json).context("parsing v2 vault file")?;
 
         if vf.format != "mevault-vault" {
             bail!("vault file has unexpected format '{}'", vf.format);
         }
         if vf.name != vault_name {
-            bail!("vault name mismatch: file has '{}', requested '{}'", vf.name, vault_name);
+            bail!(
+                "vault name mismatch: file has '{}', requested '{}'",
+                vf.name,
+                vault_name
+            );
         }
 
         let kp = &vf.key_protection;
-        self.policy.validate_blob_params(kp.mem_kib, kp.iters, kp.para)?;
+        self.policy
+            .validate_blob_params(kp.mem_kib, kp.iters, kp.para)?;
 
-        let mut kek = crypto::derive_kek(password, &kp.salt, kp.mem_kib, kp.iters, kp.para, &self.policy)
-            .context("deriving key-encryption key")?;
+        let mut kek = crypto::derive_kek(
+            password,
+            &kp.salt,
+            kp.mem_kib,
+            kp.iters,
+            kp.para,
+            &self.policy,
+        )
+        .context("deriving key-encryption key")?;
         let kek_aad = format!("mevault-kek\0{}\0{vault_name}", vf.vault_id).into_bytes();
         let dek = crypto::unwrap_dek(&kp.nonce, &kp.wrapped_dek, &kek, &kek_aad)
             .context("wrong password or corrupt vault")?;
@@ -567,21 +702,24 @@ impl VaultStore {
         password: &SecretString,
     ) -> Result<UnlockedVault> {
         // Parse and validate v1.
-        let vf_v1: VaultFile = serde_json::from_str(raw_json)
-            .context("parsing v1 vault file")?;
+        let vf_v1: VaultFile = serde_json::from_str(raw_json).context("parsing v1 vault file")?;
 
         if vf_v1.format != "mevault-vault" {
             bail!("vault file has unexpected format '{}'", vf_v1.format);
         }
         if vf_v1.name != vault_name {
-            bail!("vault name mismatch: file has '{}', expected '{}'", vf_v1.name, vault_name);
+            bail!(
+                "vault name mismatch: file has '{}', expected '{}'",
+                vf_v1.name,
+                vault_name
+            );
         }
 
         // Decrypt v1 secrets.
         let plaintext = crypto::decrypt(&vf_v1.blob, password, vault_name.as_bytes(), &self.policy)
             .context("wrong password or corrupt v1 vault")?;
-        let secrets: HashMap<String, String> = serde_json::from_slice(&plaintext)
-            .context("v1 vault contents corrupt")?;
+        let secrets: HashMap<String, String> =
+            serde_json::from_slice(&plaintext).context("v1 vault contents corrupt")?;
 
         // Build v2 file (reuse vault's created_at; assign a fresh vault_id).
         let vault_id = uuid::Uuid::new_v4().to_string();
@@ -597,25 +735,21 @@ impl VaultStore {
         // Backup failure is a hard error — we must never lose the original
         // before we have verified the new v2 file is correct.
         let bak = path.with_extension("v1.bak");
-        let v1_bytes = std::fs::read(path)
-            .context("reading v1 vault file for backup")?;
+        let v1_bytes = std::fs::read(path).context("reading v1 vault file for backup")?;
 
         if bak.exists() {
             // A prior interrupted migration left a .v1.bak.  Compare content:
             // if identical we can reuse it; if different create a unique one.
-            let existing_bak = std::fs::read(&bak)
-                .context("reading existing .v1.bak for comparison")?;
+            let existing_bak =
+                std::fs::read(&bak).context("reading existing .v1.bak for comparison")?;
             if existing_bak != v1_bytes {
-                let unique_bak = path.with_extension(
-                    format!("v1.bak.{}", uuid::Uuid::new_v4()),
-                );
+                let unique_bak = path.with_extension(format!("v1.bak.{}", uuid::Uuid::new_v4()));
                 write_and_sync(&unique_bak, &v1_bytes)
                     .context("creating unique v1 migration backup")?;
             }
             // else: .v1.bak already contains exactly this content — reuse it.
         } else {
-            write_and_sync(&bak, &v1_bytes)
-                .context("creating mandatory v1 migration backup")?;
+            write_and_sync(&bak, &v1_bytes).context("creating mandatory v1 migration backup")?;
         }
 
         // ── Atomic write with full payload verification before promotion ───
@@ -634,22 +768,30 @@ impl VaultStore {
         atomic_write_verified(path, json.as_bytes(), move |tmp_path| {
             let written = std::fs::read_to_string(tmp_path)
                 .context("re-reading v2 temp file for verification")?;
-            let vf: VaultFileV2 = serde_json::from_str(&written)
-                .context("v2 temp file is not valid JSON")?;
+            let vf: VaultFileV2 =
+                serde_json::from_str(&written).context("v2 temp file is not valid JSON")?;
             if vf.format != "mevault-vault" || vf.version != "2" || vf.name != vn {
                 bail!("v2 temp file has unexpected header fields");
             }
             let kp = &vf.key_protection;
             policy_clone.validate_blob_params(kp.mem_kib, kp.iters, kp.para)?;
             let kek_aad = format!("mevault-kek\0{}\0{vn}", vf.vault_id).into_bytes();
-            let mut kek = crypto::derive_kek(&pw_clone, &kp.salt, kp.mem_kib, kp.iters, kp.para, &policy_clone)
-                .context("re-deriving KEK for migration verification")?;
+            let mut kek = crypto::derive_kek(
+                &pw_clone,
+                &kp.salt,
+                kp.mem_kib,
+                kp.iters,
+                kp.para,
+                &policy_clone,
+            )
+            .context("re-deriving KEK for migration verification")?;
             let dek_check = crypto::unwrap_dek(&kp.nonce, &kp.wrapped_dek, &kek, &kek_aad)
                 .context("DEK unwrap failed during migration verification")?;
             kek.zeroize();
             let payload_aad = format!("mevault-payload\0{}\0{vn}", vf.vault_id).into_bytes();
-            let pt = crypto::decrypt_payload(&vf.payload_nonce, &vf.payload, &dek_check, &payload_aad)
-                .context("payload decryption failed during migration verification")?;
+            let pt =
+                crypto::decrypt_payload(&vf.payload_nonce, &vf.payload, &dek_check, &payload_aad)
+                    .context("payload decryption failed during migration verification")?;
             let verified: HashMap<String, String> = serde_json::from_slice(&pt)
                 .context("secrets map is corrupt in migrated v2 file")?;
             let _verified = SecretMap(verified); // zeroizes all values on drop
@@ -665,7 +807,12 @@ impl VaultStore {
         })
     }
 
-    fn verify_existing_vault(&self, path: &Path, vault_name: &str, password: &SecretString) -> Result<()> {
+    fn verify_existing_vault(
+        &self,
+        path: &Path,
+        vault_name: &str,
+        password: &SecretString,
+    ) -> Result<()> {
         let raw_json = std::fs::read_to_string(path)?;
         let raw: serde_json::Value = serde_json::from_str(&raw_json)?;
 
@@ -681,7 +828,9 @@ impl VaultStore {
         }
 
         match raw["version"].as_str().unwrap_or("1") {
-            "2" => { self.unlock_v2_from_json(&raw_json, vault_name, password)?; }
+            "2" => {
+                self.unlock_v2_from_json(&raw_json, vault_name, password)?;
+            }
             _ => {
                 // V1: verify by decrypting.
                 let vf: VaultFile = serde_json::from_str(&raw_json)?;
@@ -703,13 +852,22 @@ impl VaultStore {
         let mut vf: VaultFileV2 = serde_json::from_str(raw_json)?;
         let kek_salt = crypto::new_kek_salt();
         let (mem, iters, para) = self.policy.kdf_profile.params();
-        let mut new_kek = crypto::derive_kek(new_password, kek_salt.as_str(), mem, iters, para, &self.policy)?;
+        let mut new_kek = crypto::derive_kek(
+            new_password,
+            kek_salt.as_str(),
+            mem,
+            iters,
+            para,
+            &self.policy,
+        )?;
         let kek_aad = format!("mevault-kek\0{}\0{vault_name}", vf.vault_id).into_bytes();
         let (new_nonce, new_wrapped) = crypto::wrap_dek(&vault.dek, &new_kek, &kek_aad)?;
         new_kek.zeroize();
 
         vf.key_protection = KeyProtection {
-            mem_kib: mem, iters, para,
+            mem_kib: mem,
+            iters,
+            para,
             salt: kek_salt.to_string(),
             nonce: new_nonce,
             wrapped_dek: new_wrapped,
@@ -719,18 +877,27 @@ impl VaultStore {
         let json = serde_json::to_string_pretty(&vf)?;
         atomic_write(path, json.as_bytes())
     }
-
 }
 
 impl Default for VaultStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn sanitize_vault_name(name: &str) -> Result<String> {
-    if name.is_empty() { bail!("vault name cannot be empty"); }
+    if name.is_empty() {
+        bail!("vault name cannot be empty");
+    }
     Ok(name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect())
 }
 
@@ -743,7 +910,9 @@ fn sanitize_vault_name(name: &str) -> Result<String> {
 fn write_and_sync(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
-        .write(true).create(true).truncate(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
         .open(path)
         .with_context(|| format!("opening {} for write+sync", path.display()))?;
     f.write_all(data)
@@ -829,7 +998,7 @@ mod tests {
     use crate::crypto::CryptoPolicy;
 
     fn pw() -> SecretString {
-        SecretString::new("correct-horse-battery-staple".to_owned().into())
+        SecretString::new("correct-horse-battery-staple".to_owned())
     }
 
     fn store(dir: &tempfile::TempDir) -> VaultStore {
@@ -859,7 +1028,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir);
         s.create_vault("V", &pw()).unwrap();
-        let wrong = SecretString::new("wrong-password".to_owned().into());
+        let wrong = SecretString::new("wrong-password".to_owned());
         assert!(s.create_vault("V", &wrong).is_err());
     }
 
@@ -880,9 +1049,12 @@ mod tests {
         s.create_vault("V", &pw()).unwrap();
         let vault = s.unlock("V", &pw()).unwrap();
 
-        let val = SecretString::new("postgres://localhost".to_owned().into());
+        let val = SecretString::new("postgres://localhost".to_owned());
         vault.set_secret("DB_URL", &val).unwrap();
-        assert_eq!(vault.get_secret("DB_URL").unwrap().expose_secret(), "postgres://localhost");
+        assert_eq!(
+            vault.get_secret("DB_URL").unwrap().expose_secret(),
+            "postgres://localhost"
+        );
 
         vault.remove_secret("DB_URL").unwrap();
         assert!(vault.get_secret("DB_URL").is_err());
@@ -894,9 +1066,12 @@ mod tests {
         let s = store(&dir);
         s.create_vault("V", &pw()).unwrap();
 
-        let val = SecretString::new("secret-value".to_owned().into());
+        let val = SecretString::new("secret-value".to_owned());
         s.set_secret("K", &val, "V", Some(&pw())).unwrap();
-        assert_eq!(s.get_secret("K", "V", Some(&pw())).unwrap().expose_secret(), "secret-value");
+        assert_eq!(
+            s.get_secret("K", "V", Some(&pw())).unwrap().expose_secret(),
+            "secret-value"
+        );
         s.remove_secret("K", "V", Some(&pw())).unwrap();
         assert!(s.get_secret("K", "V", Some(&pw())).is_err());
     }
@@ -909,13 +1084,15 @@ mod tests {
 
         let mut batch = HashMap::new();
         for i in 0..10usize {
-            batch.insert(format!("K{i}"), SecretString::new(format!("v{i}").into()));
+            batch.insert(format!("K{i}"), SecretString::new(format!("v{i}")));
         }
         s.set_secrets_bulk(&batch, "V", &pw()).unwrap();
 
         for i in 0..10usize {
             assert_eq!(
-                s.get_secret(&format!("K{i}"), "V", Some(&pw())).unwrap().expose_secret(),
+                s.get_secret(&format!("K{i}"), "V", Some(&pw()))
+                    .unwrap()
+                    .expose_secret(),
                 &format!("v{i}")
             );
         }
@@ -931,12 +1108,15 @@ mod tests {
 
         let mut batch = HashMap::new();
         for i in 0..20usize {
-            batch.insert(format!("K{i}"), SecretString::new(format!("v{i}").into()));
+            batch.insert(format!("K{i}"), SecretString::new(format!("v{i}")));
         }
         vault.set_secrets_bulk(&batch).unwrap();
         assert_eq!(vault.secret_names().unwrap().len(), 20);
         for i in 0..20usize {
-            assert_eq!(vault.get_secret(&format!("K{i}")).unwrap().expose_secret(), &format!("v{i}"));
+            assert_eq!(
+                vault.get_secret(&format!("K{i}")).unwrap().expose_secret(),
+                &format!("v{i}")
+            );
         }
     }
 
@@ -945,7 +1125,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir);
         s.create_vault("V", &pw()).unwrap();
-        let bad = SecretString::new("wrong-password".to_owned().into());
+        let bad = SecretString::new("wrong-password".to_owned());
         assert!(s.unlock("V", &bad).is_err());
     }
 
@@ -955,17 +1135,20 @@ mod tests {
         let s = store(&dir);
         s.create_vault("V", &pw()).unwrap();
 
-        let val = SecretString::new("precious-secret".to_owned().into());
+        let val = SecretString::new("precious-secret".to_owned());
         s.set_secret("K", &val, "V", Some(&pw())).unwrap();
 
-        let new_pw = SecretString::new("new-horse-battery-staple".to_owned().into());
+        let new_pw = SecretString::new("new-horse-battery-staple".to_owned());
         s.change_password("V", &pw(), &new_pw).unwrap();
 
         // Old password must fail.
         assert!(s.unlock("V", &pw()).is_err());
         // New password must succeed and preserve secrets.
         let vault = s.unlock("V", &new_pw).unwrap();
-        assert_eq!(vault.get_secret("K").unwrap().expose_secret(), "precious-secret");
+        assert_eq!(
+            vault.get_secret("K").unwrap().expose_secret(),
+            "precious-secret"
+        );
     }
 
     #[test]
@@ -988,25 +1171,30 @@ mod tests {
         s.create_vault("A", &pw()).unwrap();
         s.create_vault("B", &pw()).unwrap();
 
-        let val = SecretString::new("secret-a".to_owned().into());
+        let val = SecretString::new("secret-a".to_owned());
         s.set_secret("K", &val, "A", Some(&pw())).unwrap();
 
         // Read A's vault file and extract the payload fields.
         let path_a = s.vault_path("A").unwrap();
-        let a_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
+        let a_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path_a).unwrap()).unwrap();
         let a_payload = a_json["payload"].as_str().unwrap().to_owned();
         let a_payload_nonce = a_json["payload_nonce"].as_str().unwrap().to_owned();
 
         // Transplant A's payload into B's vault file.
         let path_b = s.vault_path("B").unwrap();
-        let mut b_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path_b).unwrap()).unwrap();
+        let mut b_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path_b).unwrap()).unwrap();
         b_json["payload"] = serde_json::Value::String(a_payload);
         b_json["payload_nonce"] = serde_json::Value::String(a_payload_nonce);
         std::fs::write(&path_b, serde_json::to_string_pretty(&b_json).unwrap()).unwrap();
 
         // Unlocking B must fail because the payload AAD (vault_id of B) doesn't match.
         let vault_b = s.unlock("B", &pw()).unwrap();
-        assert!(vault_b.get_secret("K").is_err(), "transplanted payload must be rejected");
+        assert!(
+            vault_b.get_secret("K").is_err(),
+            "transplanted payload must be rejected"
+        );
     }
 
     #[test]
@@ -1021,7 +1209,13 @@ mod tests {
         let path = vault_dir.join("V.mvault");
 
         let aad = b"V";
-        let blob = crypto::encrypt(b"{\"K\":\"v1-secret\"}", &pw(), aad, &CryptoPolicy::fast_test()).unwrap();
+        let blob = crypto::encrypt(
+            b"{\"K\":\"v1-secret\"}",
+            &pw(),
+            aad,
+            &CryptoPolicy::fast_test(),
+        )
+        .unwrap();
         let v1 = VaultFile {
             format: "mevault-vault".to_owned(),
             version: "1".to_owned(),
@@ -1057,17 +1251,39 @@ mod tests {
     fn vaults_are_isolated() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir);
-        let pw_a = SecretString::new("password-for-project-a".to_owned().into());
-        let pw_b = SecretString::new("password-for-project-b".to_owned().into());
+        let pw_a = SecretString::new("password-for-project-a".to_owned());
+        let pw_b = SecretString::new("password-for-project-b".to_owned());
 
         s.create_vault("ProjectA", &pw_a).unwrap();
         s.create_vault("ProjectB", &pw_b).unwrap();
 
-        s.set_secret("S", &SecretString::new("value-a".to_owned().into()), "ProjectA", Some(&pw_a)).unwrap();
-        s.set_secret("S", &SecretString::new("value-b".to_owned().into()), "ProjectB", Some(&pw_b)).unwrap();
+        s.set_secret(
+            "S",
+            &SecretString::new("value-a".to_owned()),
+            "ProjectA",
+            Some(&pw_a),
+        )
+        .unwrap();
+        s.set_secret(
+            "S",
+            &SecretString::new("value-b".to_owned()),
+            "ProjectB",
+            Some(&pw_b),
+        )
+        .unwrap();
 
-        assert_eq!(s.get_secret("S", "ProjectA", Some(&pw_a)).unwrap().expose_secret(), "value-a");
-        assert_eq!(s.get_secret("S", "ProjectB", Some(&pw_b)).unwrap().expose_secret(), "value-b");
+        assert_eq!(
+            s.get_secret("S", "ProjectA", Some(&pw_a))
+                .unwrap()
+                .expose_secret(),
+            "value-a"
+        );
+        assert_eq!(
+            s.get_secret("S", "ProjectB", Some(&pw_b))
+                .unwrap()
+                .expose_secret(),
+            "value-b"
+        );
         assert!(s.get_secret("S", "ProjectB", Some(&pw_a)).is_err());
         assert!(s.get_secret("S", "ProjectA", Some(&pw_b)).is_err());
     }
@@ -1077,7 +1293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(&dir);
         s.create_vault("V", &pw()).unwrap();
-        let tricky = SecretString::new("it's a \"test\" value\n with newline".to_owned().into());
+        let tricky = SecretString::new("it's a \"test\" value\n with newline".to_owned());
         s.set_secret("K", &tricky, "V", Some(&pw())).unwrap();
         let got = s.get_secret("K", "V", Some(&pw())).unwrap();
         assert_eq!(got.expose_secret(), "it's a \"test\" value\n with newline");
@@ -1111,6 +1327,9 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
-        assert!(leftover.is_empty(), "temp file must be cleaned up after verification failure");
+        assert!(
+            leftover.is_empty(),
+            "temp file must be cleaned up after verification failure"
+        );
     }
 }

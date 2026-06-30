@@ -8,8 +8,7 @@ use windows::{
     Win32::{
         Foundation::{CloseHandle, FILETIME, HANDLE},
         NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID,
-            TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
         },
         System::{
             Diagnostics::ToolHelp::{
@@ -17,14 +16,13 @@ use windows::{
                 TH32CS_SNAPPROCESS,
             },
             JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW,
-                JobObjectExtendedLimitInformation, SetInformationJobObject,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
             Threading::{
-                GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-                PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+                GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
             },
         },
     },
@@ -41,8 +39,7 @@ pub fn build_process_chain(pid: u32) -> Result<Vec<ProcessInfo>> {
             break;
         }
 
-        let exe_path = query_exe_path(current_pid)
-            .unwrap_or_else(|_| PathBuf::from("<unknown>"));
+        let exe_path = query_exe_path(current_pid).unwrap_or_else(|_| PathBuf::from("<unknown>"));
 
         let parent_pid = get_parent_pid(current_pid).ok();
 
@@ -112,12 +109,7 @@ pub fn find_connection_pid(local_port: u16, remote_port: u16) -> Result<u32> {
 
     let table = unsafe { &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
     let count = table.dwNumEntries as usize;
-    let rows = unsafe {
-        std::slice::from_raw_parts(
-            table.table.as_ptr(),
-            count,
-        )
-    };
+    let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
 
     for row in rows {
         let row_local_port = u16::from_be((row.dwLocalPort & 0xFFFF) as u16);
@@ -127,22 +119,25 @@ pub fn find_connection_pid(local_port: u16, remote_port: u16) -> Result<u32> {
         }
     }
 
-    bail!(
-        "no TCP connection found for local:{local_port} remote:{remote_port}"
-    )
+    bail!("no TCP connection found for local:{local_port} remote:{remote_port}")
 }
 
 #[cfg(target_os = "windows")]
 fn query_exe_path(pid: u32) -> Result<PathBuf> {
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-            .context("OpenProcess")?;
+        let handle =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).context("OpenProcess")?;
         let _guard = HandleGuard(handle);
 
         let mut buf = vec![0u16; 1024];
         let mut size = buf.len() as u32;
-        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size)
-            .context("QueryFullProcessImageNameW")?;
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
+        .context("QueryFullProcessImageNameW")?;
 
         let path_str = String::from_utf16_lossy(&buf[..size as usize]);
         Ok(PathBuf::from(path_str))
@@ -152,8 +147,8 @@ fn query_exe_path(pid: u32) -> Result<PathBuf> {
 #[cfg(target_os = "windows")]
 fn get_parent_pid(pid: u32) -> Result<u32> {
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            .context("CreateToolhelp32Snapshot")?;
+        let snapshot =
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).context("CreateToolhelp32Snapshot")?;
         let _guard = HandleGuard(snapshot);
 
         let mut entry = PROCESSENTRY32W {
@@ -176,14 +171,13 @@ fn get_parent_pid(pid: u32) -> Result<u32> {
 }
 
 #[cfg(target_os = "windows")]
-fn verify_signature(path: &PathBuf) -> Result<(bool, Option<String>)> {
+fn verify_signature(path: &std::path::Path) -> Result<(bool, Option<String>)> {
+    use windows::core::GUID;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Security::WinTrust::{
         WinVerifyTrust, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_DATA_PROVIDER_FLAGS,
-        WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_VERIFY,
-        WTD_UI_NONE,
+        WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
     };
-    use windows::core::GUID;
 
     let path_wide: Vec<u16> = path
         .to_string_lossy()
@@ -238,7 +232,9 @@ struct HandleGuard(HANDLE);
 #[cfg(target_os = "windows")]
 impl Drop for HandleGuard {
     fn drop(&mut self) {
-        unsafe { let _ = CloseHandle(self.0); }
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
     }
 }
 
@@ -247,8 +243,8 @@ impl Drop for HandleGuard {
 #[cfg(target_os = "windows")]
 pub fn create_job_object() -> Result<JobObject> {
     unsafe {
-        let handle = CreateJobObjectW(None, windows::core::PCWSTR::null())
-            .context("CreateJobObjectW")?;
+        let handle =
+            CreateJobObjectW(None, windows::core::PCWSTR::null()).context("CreateJobObjectW")?;
 
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -279,22 +275,24 @@ pub fn assign_to_job(job: &JobObject, pid: u32) -> Result<()> {
 /// Close the Job Object handle — called by `JobObject::drop`.
 #[cfg(target_os = "windows")]
 pub(super) fn drop_job_object(handle: HANDLE) {
-    unsafe { let _ = CloseHandle(handle); }
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
 }
 
-/// Get the process creation time as a 64-bit FILETIME.
+/// Get the process creation time as a 64-bit FILETIME value.
 /// Returns Err if the process does not exist or cannot be opened.
 #[cfg(target_os = "windows")]
-fn get_process_creation_time(pid: u32) -> Result<u64> {
+pub fn get_process_creation_time(pid: u32) -> Result<u64> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
             .context("OpenProcess for creation time")?;
         let _guard = HandleGuard(handle);
 
         let mut creation = FILETIME::default();
-        let mut exit    = FILETIME::default();
-        let mut kernel  = FILETIME::default();
-        let mut user    = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
 
         GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
             .context("GetProcessTimes")?;
@@ -308,11 +306,13 @@ fn get_process_creation_time(pid: u32) -> Result<u64> {
 /// Call immediately after GetNamedPipeClientProcessId returns.
 #[cfg(target_os = "windows")]
 pub fn record_grant(pid: u32) -> Result<ProcessGrant> {
-    let created_at = get_process_creation_time(pid)
-        .context("reading process creation time")?;
-    let exe_path = query_exe_path(pid)
-        .context("reading process exe path")?;
-    Ok(ProcessGrant { pid, created_at, exe_path })
+    let created_at = get_process_creation_time(pid).context("reading process creation time")?;
+    let exe_path = query_exe_path(pid).context("reading process exe path")?;
+    Ok(ProcessGrant {
+        pid,
+        created_at,
+        exe_path,
+    })
 }
 
 /// Re-verify that the process at grant.pid is still the same process that

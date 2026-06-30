@@ -5,8 +5,9 @@ use mevault_core::{
     export::import_auto,
     vault::SecretStoreBridge,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 use crate::commands::add::prompt_vault_password;
 
@@ -26,7 +27,7 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
     let file_pw: Option<SecretString> = if needs_file_pw {
         let pw = rpassword::prompt_password("File decryption password: ")
             .context("reading file password")?;
-        Some(SecretString::new(pw.into()))
+        Some(SecretString::new(pw))
     } else {
         None
     };
@@ -51,16 +52,39 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
     let bridge = SecretStoreBridge::new();
     let appdata = std::env::var("APPDATA").context("APPDATA env var not set")?;
     let db_path = PathBuf::from(appdata).join("MeVault").join("audit.db");
-    let audit = AuditLog::open(&db_path).await.context("opening audit log")?;
+    let audit = AuditLog::open(&db_path)
+        .await
+        .context("opening audit log")?;
+
+    // Keep the original values in Zeroizing wrappers for post-import verification.
+    let original_values: Vec<(String, Zeroizing<String>)> = entries
+        .iter()
+        .map(|e| (e.name.clone(), Zeroizing::new(e.value.clone())))
+        .collect();
 
     let secrets_map: std::collections::HashMap<String, SecretString> = entries
         .iter()
-        .map(|e| (e.name.clone(), SecretString::new(e.value.clone().into())))
+        .map(|e| (e.name.clone(), SecretString::new(e.value.clone())))
         .collect();
 
     bridge
         .set_secrets_bulk(&secrets_map, vault_name, &vault_pw)
         .context("importing secrets into vault")?;
+
+    // Transactional verification: read each secret back and compare.
+    for (name, expected) in &original_values {
+        let stored = bridge
+            .get_secret(name, vault_name, Some(&vault_pw))
+            .with_context(|| {
+                format!("verification read-back failed for '{name}' — vault may be corrupted")
+            })?;
+        let stored_str: Zeroizing<String> = Zeroizing::new(stored.expose_secret().to_owned());
+        if *stored_str != **expected {
+            anyhow::bail!(
+                "Import verification failed — vault may be corrupted (mismatch on '{name}')"
+            );
+        }
+    }
 
     for entry in &entries {
         audit
@@ -73,6 +97,6 @@ pub async fn run(file: PathBuf, vault_override: Option<String>) -> Result<()> {
     }
 
     let count = entries.len();
-    println!("Imported {count} secret(s) into vault '{vault_name}'.");
+    println!("Imported and verified {count} secret(s) into vault '{vault_name}'.");
     Ok(())
 }

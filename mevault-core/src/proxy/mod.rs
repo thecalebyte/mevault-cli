@@ -45,7 +45,10 @@ pub fn build_router(state: ProxyState) -> Router {
 
 /// Bind to 127.0.0.1:52731 and serve until the returned future is awaited.
 /// Uses graceful-shutdown: pass in a `shutdown` future (e.g. ctrl-c signal).
-pub async fn run_proxy(state: ProxyState, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> Result<()> {
+pub async fn run_proxy(
+    state: ProxyState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let addr: SocketAddr = "127.0.0.1:52731"
         .parse()
         .context("parsing proxy bind address")?;
@@ -206,10 +209,16 @@ fn require_active_session<'a>(
     lock: &'a tokio::sync::RwLockReadGuard<'a, Option<crate::session::Session>>,
 ) -> Result<&'a crate::session::Session, (StatusCode, Json<Value>)> {
     let session = lock.as_ref().ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, Json(json!({ "error": "vault_locked" })))
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "vault_locked" })),
+        )
     })?;
     if !session.is_active() {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "session_expired" }))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "session_expired" })),
+        ));
     }
     Ok(session)
 }
@@ -256,9 +265,11 @@ mod tests {
                 require_signature_check: false,
                 require_parent_check: true,
                 require_working_dir_check: false,
+                allow_cli_reveal: false,
             },
             allow_list: AllowListConfig { rules: vec![] },
             deny_list: DenyListConfig::default(),
+            process_rules: vec![],
         })
     }
 
@@ -269,8 +280,9 @@ mod tests {
 
         // Build a real vault with fast_test policy so proxy tests don't need
         // to hold a password in a session — the DEK is cached in UnlockedVault.
-        let pw = SecretString::new("proxy-test-password".to_owned().into());
-        let store = VaultStore::new_at_with_policy(dir.path().to_path_buf(), CryptoPolicy::fast_test());
+        let pw = SecretString::new("proxy-test-password".to_owned());
+        let store =
+            VaultStore::new_at_with_policy(dir.path().to_path_buf(), CryptoPolicy::fast_test());
         store.create_vault("TestVault", &pw).unwrap();
         if !secrets.is_empty() {
             store.set_secrets_bulk(&secrets, "TestVault", &pw).unwrap();
@@ -293,7 +305,14 @@ mod tests {
         }
     }
 
-    fn test_app(state: ProxyState) -> impl tower::Service<Request<axum::body::Body>, Response = axum::response::Response, Error = std::convert::Infallible> + Clone + Send {
+    fn test_app(
+        state: ProxyState,
+    ) -> impl tower::Service<
+        Request<axum::body::Body>,
+        Response = axum::response::Response,
+        Error = std::convert::Infallible,
+    > + Clone
+           + Send {
         let mock_addr = SocketAddr::from(([127, 0, 0, 1], 1234));
         build_router(state).layer(MockConnectInfo(mock_addr))
     }
@@ -302,7 +321,11 @@ mod tests {
     async fn status_returns_active() {
         let state = make_state(HashMap::new()).await;
         let resp = test_app(state)
-            .oneshot(Request::get("/status").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -317,7 +340,7 @@ mod tests {
         let mut secrets = HashMap::new();
         secrets.insert(
             "DB_URL".to_owned(),
-            SecretString::new("postgres://test".to_owned().into()),
+            SecretString::new("postgres://test".to_owned()),
         );
         let state = make_state(secrets).await;
 
@@ -357,7 +380,11 @@ mod tests {
     async fn inject_route_does_not_exist() {
         let state = make_state(HashMap::new()).await;
         let resp = test_app(state)
-            .oneshot(Request::get("/inject").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/inject")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

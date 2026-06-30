@@ -3,13 +3,15 @@
 /// All tests are fully isolated — each uses its own temp directory.
 /// No shared state, no system SecretStore access, no destructive resets.
 /// Tests are safe to run in parallel without any special flags.
-
-use mevault_core::{crypto::{self, CryptoPolicy}, vault::VaultStore};
+use mevault_core::{
+    crypto::{self, CryptoPolicy},
+    vault::VaultStore,
+};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 
 fn pw(s: &str) -> SecretString {
-    SecretString::new(s.to_owned().into())
+    SecretString::new(s.to_owned())
 }
 
 /// Build a VaultStore backed by a temp directory using fast KDF params so the
@@ -31,7 +33,8 @@ fn vault_does_not_exist_initially() {
 fn create_vault_then_exists() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(&dir);
-    s.create_vault("MyProject", &pw("password-12-chars")).unwrap();
+    s.create_vault("MyProject", &pw("password-12-chars"))
+        .unwrap();
     assert!(s.vault_exists("MyProject").unwrap());
 }
 
@@ -42,10 +45,14 @@ fn create_vault_is_idempotent_and_preserves_secrets() {
     let pw = pw("idempotent-create-pw");
 
     s.create_vault("V", &pw).unwrap();
-    s.set_secret("K", &SecretString::new("v".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret("K", &SecretString::new("v".to_owned()), "V", Some(&pw))
+        .unwrap();
 
     s.create_vault("V", &pw).unwrap();
-    assert_eq!(s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(), "v");
+    assert_eq!(
+        s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(),
+        "v"
+    );
 }
 
 #[test]
@@ -55,7 +62,10 @@ fn create_vault_wrong_password_on_existing_vault_rejected() {
     s.create_vault("V", &pw("correct-password-here")).unwrap();
 
     let err = s.create_vault("V", &pw("wrong-password-here"));
-    assert!(err.is_err(), "wrong password on existing vault must return an error");
+    assert!(
+        err.is_err(),
+        "wrong password on existing vault must return an error"
+    );
 }
 
 #[test]
@@ -65,7 +75,13 @@ fn set_get_remove() {
     let pw = pw("set-get-remove-pw-xx");
 
     s.create_vault("V", &pw).unwrap();
-    s.set_secret("DB_URL", &SecretString::new("postgres://localhost".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret(
+        "DB_URL",
+        &SecretString::new("postgres://localhost".to_owned()),
+        "V",
+        Some(&pw),
+    )
+    .unwrap();
 
     let got = s.get_secret("DB_URL", "V", Some(&pw)).unwrap();
     assert_eq!(got.expose_secret(), "postgres://localhost");
@@ -81,10 +97,15 @@ fn overwrite_secret() {
     let pw = pw("overwrite-secret-pw");
 
     s.create_vault("V", &pw).unwrap();
-    s.set_secret("K", &SecretString::new("old".to_owned().into()), "V", Some(&pw)).unwrap();
-    s.set_secret("K", &SecretString::new("new".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret("K", &SecretString::new("old".to_owned()), "V", Some(&pw))
+        .unwrap();
+    s.set_secret("K", &SecretString::new("new".to_owned()), "V", Some(&pw))
+        .unwrap();
 
-    assert_eq!(s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(), "new");
+    assert_eq!(
+        s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(),
+        "new"
+    );
 }
 
 #[test]
@@ -95,7 +116,8 @@ fn wrong_password_rejected() {
     let wrong = pw("wrong-password-vault");
 
     s.create_vault("V", &correct).unwrap();
-    s.set_secret("K", &SecretString::new("v".to_owned().into()), "V", Some(&correct)).unwrap();
+    s.set_secret("K", &SecretString::new("v".to_owned()), "V", Some(&correct))
+        .unwrap();
 
     assert!(s.get_secret("K", "V", Some(&wrong)).is_err());
 }
@@ -108,7 +130,8 @@ fn list_secrets_sorted() {
 
     s.create_vault("V", &pw).unwrap();
     for name in &["ZEBRA", "APPLE", "MANGO"] {
-        s.set_secret(name, &SecretString::new("x".to_owned().into()), "V", Some(&pw)).unwrap();
+        s.set_secret(name, &SecretString::new("x".to_owned()), "V", Some(&pw))
+            .unwrap();
     }
 
     let list = s.list_secrets("V", Some(&pw)).unwrap();
@@ -123,8 +146,10 @@ fn unlock_and_list_names() {
     let pw = pw("unlock-list-names-pw");
 
     s.create_vault("V", &pw).unwrap();
-    s.set_secret("A", &SecretString::new("1".to_owned().into()), "V", Some(&pw)).unwrap();
-    s.set_secret("B", &SecretString::new("2".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret("A", &SecretString::new("1".to_owned()), "V", Some(&pw))
+        .unwrap();
+    s.set_secret("B", &SecretString::new("2".to_owned()), "V", Some(&pw))
+        .unwrap();
 
     let names = s.unlock_and_list_names("V", &pw).unwrap();
     assert!(names.contains(&"A".to_owned()));
@@ -138,7 +163,13 @@ fn unlock_and_preload() {
     let pw = pw("unlock-and-preload-pw");
 
     s.create_vault("V", &pw).unwrap();
-    s.set_secret("DB", &SecretString::new("postgres://host".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret(
+        "DB",
+        &SecretString::new("postgres://host".to_owned()),
+        "V",
+        Some(&pw),
+    )
+    .unwrap();
 
     let map = s.unlock_and_preload("V", &pw).unwrap();
     assert_eq!(map["DB"].expose_secret(), "postgres://host");
@@ -170,7 +201,10 @@ fn name_sanitization_collision_detected() {
     let err = s.create_vault("My?Vault", &pw);
     assert!(err.is_err(), "colliding sanitized names must be rejected");
     let msg = err.unwrap_err().to_string();
-    assert!(msg.contains("conflicts"), "error should mention 'conflicts': {msg}");
+    assert!(
+        msg.contains("conflicts"),
+        "error should mention 'conflicts': {msg}"
+    );
 }
 
 #[test]
@@ -186,8 +220,10 @@ fn created_at_preserved_on_secret_update() {
         serde_json::from_str(&std::fs::read_to_string(&vault_path).unwrap()).unwrap();
     let original_ts = vf1["created_at"].as_str().unwrap().to_owned();
 
-    s.set_secret("K1", &SecretString::new("a".to_owned().into()), "V", Some(&pw)).unwrap();
-    s.set_secret("K2", &SecretString::new("b".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret("K1", &SecretString::new("a".to_owned()), "V", Some(&pw))
+        .unwrap();
+    s.set_secret("K2", &SecretString::new("b".to_owned()), "V", Some(&pw))
+        .unwrap();
     s.remove_secret("K1", "V", Some(&pw)).unwrap();
 
     let vf2: serde_json::Value =
@@ -213,14 +249,16 @@ fn set_secrets_bulk_round_trip() {
 
     let mut batch: HashMap<String, SecretString> = HashMap::new();
     for i in 0..20usize {
-        batch.insert(format!("KEY_{i:02}"), SecretString::new(format!("val-{i}").into()));
+        batch.insert(format!("KEY_{i:02}"), SecretString::new(format!("val-{i}")));
     }
     s.set_secrets_bulk(&batch, "V", &pw).unwrap();
 
     assert_eq!(s.list_secrets("V", Some(&pw)).unwrap().len(), 20);
     for i in 0..20usize {
         assert_eq!(
-            s.get_secret(&format!("KEY_{i:02}"), "V", Some(&pw)).unwrap().expose_secret(),
+            s.get_secret(&format!("KEY_{i:02}"), "V", Some(&pw))
+                .unwrap()
+                .expose_secret(),
             &format!("val-{i}")
         );
     }
@@ -233,14 +271,30 @@ fn set_secrets_bulk_merges_with_existing() {
     let pw = pw("bulk-merge-test-password");
 
     s.create_vault("V", &pw).unwrap();
-    s.set_secret("EXISTING", &SecretString::new("keep-me".to_owned().into()), "V", Some(&pw)).unwrap();
+    s.set_secret(
+        "EXISTING",
+        &SecretString::new("keep-me".to_owned()),
+        "V",
+        Some(&pw),
+    )
+    .unwrap();
 
     let mut batch = HashMap::new();
     batch.insert("NEW_KEY".to_owned(), SecretString::new("new-val".into()));
     s.set_secrets_bulk(&batch, "V", &pw).unwrap();
 
-    assert_eq!(s.get_secret("EXISTING", "V", Some(&pw)).unwrap().expose_secret(), "keep-me");
-    assert_eq!(s.get_secret("NEW_KEY", "V", Some(&pw)).unwrap().expose_secret(), "new-val");
+    assert_eq!(
+        s.get_secret("EXISTING", "V", Some(&pw))
+            .unwrap()
+            .expose_secret(),
+        "keep-me"
+    );
+    assert_eq!(
+        s.get_secret("NEW_KEY", "V", Some(&pw))
+            .unwrap()
+            .expose_secret(),
+        "new-val"
+    );
 }
 
 #[test]
@@ -255,12 +309,34 @@ fn kdf_params_stored_in_key_protection() {
     let vf: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&vault_path).unwrap()).unwrap();
 
-    assert_eq!(vf["version"].as_str().unwrap(), "2", "new vaults must be v2");
-    assert!(vf["key_protection"]["mem_kib"].as_u64().unwrap() > 0, "mem_kib must be stored");
-    assert!(vf["key_protection"]["iters"].as_u64().unwrap() > 0, "iters must be stored");
-    assert!(vf["key_protection"]["para"].as_u64().unwrap() > 0, "para must be stored");
-    assert!(!vf["key_protection"]["salt"].as_str().unwrap_or("").is_empty(), "salt must be present");
-    assert!(!vf["vault_id"].as_str().unwrap_or("").is_empty(), "vault_id must be present");
+    assert_eq!(
+        vf["version"].as_str().unwrap(),
+        "2",
+        "new vaults must be v2"
+    );
+    assert!(
+        vf["key_protection"]["mem_kib"].as_u64().unwrap() > 0,
+        "mem_kib must be stored"
+    );
+    assert!(
+        vf["key_protection"]["iters"].as_u64().unwrap() > 0,
+        "iters must be stored"
+    );
+    assert!(
+        vf["key_protection"]["para"].as_u64().unwrap() > 0,
+        "para must be stored"
+    );
+    assert!(
+        !vf["key_protection"]["salt"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "salt must be present"
+    );
+    assert!(
+        !vf["vault_id"].as_str().unwrap_or("").is_empty(),
+        "vault_id must be present"
+    );
 }
 
 #[test]
@@ -277,7 +353,10 @@ fn header_wrong_format_rejected() {
     let err = s.get_secret("K", "V", Some(&pw("pw")));
     assert!(err.is_err());
     let msg = err.unwrap_err().to_string();
-    assert!(msg.contains("format"), "error should mention format field: {msg}");
+    assert!(
+        msg.contains("format"),
+        "error should mention format field: {msg}"
+    );
 }
 
 #[test]
@@ -294,7 +373,10 @@ fn header_wrong_version_rejected() {
     let err = s.get_secret("K", "V", Some(&pw("pw")));
     assert!(err.is_err());
     let msg = err.unwrap_err().to_string();
-    assert!(msg.contains("version"), "error should mention version field: {msg}");
+    assert!(
+        msg.contains("version"),
+        "error should mention version field: {msg}"
+    );
 }
 
 #[test]
@@ -306,7 +388,9 @@ fn kdf_mem_above_max_rejected() {
     let vault_path = dir.path().join("vaults").join("V.mvault");
     let json = std::fs::read_to_string(&vault_path).unwrap();
     let current_mem: u64 = serde_json::from_str::<serde_json::Value>(&json).unwrap()
-        ["key_protection"]["mem_kib"].as_u64().unwrap();
+        ["key_protection"]["mem_kib"]
+        .as_u64()
+        .unwrap();
     // 262145 KiB = MAX_MEM_KIB + 1
     let tampered = json.replace(
         &format!("\"mem_kib\": {current_mem}"),
@@ -327,11 +411,10 @@ fn kdf_iters_zero_rejected() {
     let vault_path = dir.path().join("vaults").join("V.mvault");
     let json = std::fs::read_to_string(&vault_path).unwrap();
     let current_iters: u64 = serde_json::from_str::<serde_json::Value>(&json).unwrap()
-        ["key_protection"]["iters"].as_u64().unwrap();
-    let tampered = json.replace(
-        &format!("\"iters\": {current_iters}"),
-        "\"iters\": 0",
-    );
+        ["key_protection"]["iters"]
+        .as_u64()
+        .unwrap();
+    let tampered = json.replace(&format!("\"iters\": {current_iters}"), "\"iters\": 0");
     std::fs::write(&vault_path, tampered).unwrap();
 
     let err = s.get_secret("K", "V", Some(&pw("pw")));
@@ -351,11 +434,33 @@ fn projects_are_fully_isolated() {
     s.create_vault("Alpha", &pw_a).unwrap();
     s.create_vault("Beta", &pw_b).unwrap();
 
-    s.set_secret("S", &SecretString::new("alpha-val".to_owned().into()), "Alpha", Some(&pw_a)).unwrap();
-    s.set_secret("S", &SecretString::new("beta-val".to_owned().into()), "Beta", Some(&pw_b)).unwrap();
+    s.set_secret(
+        "S",
+        &SecretString::new("alpha-val".to_owned()),
+        "Alpha",
+        Some(&pw_a),
+    )
+    .unwrap();
+    s.set_secret(
+        "S",
+        &SecretString::new("beta-val".to_owned()),
+        "Beta",
+        Some(&pw_b),
+    )
+    .unwrap();
 
-    assert_eq!(s.get_secret("S", "Alpha", Some(&pw_a)).unwrap().expose_secret(), "alpha-val");
-    assert_eq!(s.get_secret("S", "Beta", Some(&pw_b)).unwrap().expose_secret(), "beta-val");
+    assert_eq!(
+        s.get_secret("S", "Alpha", Some(&pw_a))
+            .unwrap()
+            .expose_secret(),
+        "alpha-val"
+    );
+    assert_eq!(
+        s.get_secret("S", "Beta", Some(&pw_b))
+            .unwrap()
+            .expose_secret(),
+        "beta-val"
+    );
 
     assert!(s.get_secret("S", "Alpha", Some(&pw_b)).is_err());
     assert!(s.get_secret("S", "Beta", Some(&pw_a)).is_err());
@@ -371,11 +476,20 @@ fn secrets_survive_store_reconstruction() {
     {
         let s = VaultStore::new_at_with_policy(vault_dir.clone(), CryptoPolicy::fast_test());
         s.create_vault("V", &pw).unwrap();
-        s.set_secret("K", &SecretString::new("persistent".to_owned().into()), "V", Some(&pw)).unwrap();
+        s.set_secret(
+            "K",
+            &SecretString::new("persistent".to_owned()),
+            "V",
+            Some(&pw),
+        )
+        .unwrap();
     }
     {
         let s = VaultStore::new_at_with_policy(vault_dir, CryptoPolicy::fast_test());
-        assert_eq!(s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(), "persistent");
+        assert_eq!(
+            s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(),
+            "persistent"
+        );
     }
 }
 
@@ -390,12 +504,20 @@ fn many_secrets_round_trip() {
     s.create_vault("V", &pw).unwrap();
     for i in 0..50usize {
         let name = format!("SECRET_{i:02}");
-        s.set_secret(&name, &SecretString::new(format!("value-{i}").into()), "V", Some(&pw)).unwrap();
+        s.set_secret(
+            &name,
+            &SecretString::new(format!("value-{i}")),
+            "V",
+            Some(&pw),
+        )
+        .unwrap();
     }
 
     assert_eq!(s.list_secrets("V", Some(&pw)).unwrap().len(), 50);
     for i in 0..50usize {
-        let got = s.get_secret(&format!("SECRET_{i:02}"), "V", Some(&pw)).unwrap();
+        let got = s
+            .get_secret(&format!("SECRET_{i:02}"), "V", Some(&pw))
+            .unwrap();
         assert_eq!(got.expose_secret(), &format!("value-{i}"));
     }
 }
@@ -408,8 +530,12 @@ fn special_chars_in_value() {
 
     s.create_vault("V", &pw).unwrap();
     let tricky = "it's a \"test\" value\n with newline & <special> chars";
-    s.set_secret("K", &SecretString::new(tricky.to_owned().into()), "V", Some(&pw)).unwrap();
-    assert_eq!(s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(), tricky);
+    s.set_secret("K", &SecretString::new(tricky.to_owned()), "V", Some(&pw))
+        .unwrap();
+    assert_eq!(
+        s.get_secret("K", "V", Some(&pw)).unwrap().expose_secret(),
+        tricky
+    );
 }
 
 // ── 5. Module stubs ──────────────────────────────────────────────────────────
@@ -465,7 +591,10 @@ async fn audit_log_write_and_filter() {
     assert_eq!(denied.len(), 1);
     assert_eq!(denied[0].process_path.as_deref(), Some("claude.exe"));
 
-    let for_db = log.query(None, Some("DATABASE_URL"), None, 100).await.unwrap();
+    let for_db = log
+        .query(None, Some("DATABASE_URL"), None, 100)
+        .await
+        .unwrap();
     assert_eq!(for_db.len(), 1);
     assert_eq!(for_db[0].event_type, "allowed");
 
@@ -514,7 +643,10 @@ fn always_deny_list_is_correct() {
         exe_path: std::path::PathBuf::from(r"C:\Python39\Scripts\uvicorn.exe"),
         ..p
     };
-    assert!(!p2.is_always_denied(), "uvicorn.exe must not be always-denied");
+    assert!(
+        !p2.is_always_denied(),
+        "uvicorn.exe must not be always-denied"
+    );
 }
 
 // ── 9. v1 migration backup ────────────────────────────────────────────────────
@@ -604,7 +736,7 @@ fn concurrent_thread_writes_are_serialized() {
         let store = Arc::clone(&s);
         let pw_clone = pw("concurrent-thread-lock-pw");
         handles.push(std::thread::spawn(move || {
-            let val = SecretString::new(format!("val-{i}").into());
+            let val = SecretString::new(format!("val-{i}"));
             store
                 .set_secret(&format!("K{i}"), &val, "ThreadVault", Some(&pw_clone))
                 .expect("set_secret should not fail under concurrent lock");
@@ -621,7 +753,10 @@ fn concurrent_thread_writes_are_serialized() {
             .unwrap();
         assert_eq!(got.expose_secret(), &format!("val-{i}"));
     }
-    assert_eq!(s.list_secrets("ThreadVault", Some(&pw_val)).unwrap().len(), n);
+    assert_eq!(
+        s.list_secrets("ThreadVault", Some(&pw_val)).unwrap().len(),
+        n
+    );
 }
 
 /// Helper: spawn vault-write-helper with credentials over stdin JSON.
@@ -682,7 +817,10 @@ fn cross_process_concurrent_writes_are_serialized() {
 
     for child in &mut children {
         let status = child.wait().unwrap();
-        assert!(status.success(), "vault-write-helper exited with non-zero status");
+        assert!(
+            status.success(),
+            "vault-write-helper exited with non-zero status"
+        );
     }
 
     let pw_val = pw(pw_str);
@@ -713,7 +851,9 @@ fn helper_handles_multiline_secret_value() {
     let mut child = spawn_helper(&vault_dir, "MLVault", "ML_KEY", multiline_val, pw_str);
     assert!(child.wait().unwrap().success());
 
-    let got = s.get_secret("ML_KEY", "MLVault", Some(&pw(pw_str))).unwrap();
+    let got = s
+        .get_secret("ML_KEY", "MLVault", Some(&pw(pw_str)))
+        .unwrap();
     assert_eq!(got.expose_secret(), multiline_val);
 }
 
@@ -736,15 +876,21 @@ fn stale_tmp_file_does_not_block_new_write() {
     assert!(stale_tmp.exists());
 
     // Writing a secret must succeed despite the stale file.
-    let val = secrecy::SecretString::new("value".to_owned().into());
-    s.set_secret("K", &val, "StaleVault", Some(&pw("stale-pw"))).unwrap();
+    let val = secrecy::SecretString::new("value".to_owned());
+    s.set_secret("K", &val, "StaleVault", Some(&pw("stale-pw")))
+        .unwrap();
 
     // The stale temp file was not touched (our write used a different name).
-    assert!(stale_tmp.exists(), "stale tmp should still be present (untouched)");
+    assert!(
+        stale_tmp.exists(),
+        "stale tmp should still be present (untouched)"
+    );
 
     // The actual secret is readable.
     assert_eq!(
-        s.get_secret("K", "StaleVault", Some(&pw("stale-pw"))).unwrap().expose_secret(),
+        s.get_secret("K", "StaleVault", Some(&pw("stale-pw")))
+            .unwrap()
+            .expose_secret(),
         "value"
     );
 }
@@ -752,11 +898,36 @@ fn stale_tmp_file_does_not_block_new_write() {
 // ── 12. Migration hardening ───────────────────────────────────────────────────
 
 /// Helper: create a v1 vault file at `path` with the given secrets JSON.
-fn write_v1_vault(path: &std::path::Path, name: &str, secrets_json: &[u8], password: &secrecy::SecretString) {
+fn write_v1_vault(
+    path: &std::path::Path,
+    name: &str,
+    secrets_json: &[u8],
+    password: &secrecy::SecretString,
+) {
     #[derive(serde::Serialize)]
-    struct V1File { format: &'static str, version: &'static str, name: String, created_at: &'static str, updated_at: &'static str, blob: crypto::EncryptedBlob }
-    let blob = crypto::encrypt(secrets_json, password, name.as_bytes(), &CryptoPolicy::fast_test()).unwrap();
-    let v1 = V1File { format: "mevault-vault", version: "1", name: name.to_owned(), created_at: "2024-01-01T00:00:00Z", updated_at: "2024-01-01T00:00:00Z", blob };
+    struct V1File {
+        format: &'static str,
+        version: &'static str,
+        name: String,
+        created_at: &'static str,
+        updated_at: &'static str,
+        blob: crypto::EncryptedBlob,
+    }
+    let blob = crypto::encrypt(
+        secrets_json,
+        password,
+        name.as_bytes(),
+        &CryptoPolicy::fast_test(),
+    )
+    .unwrap();
+    let v1 = V1File {
+        format: "mevault-vault",
+        version: "1",
+        name: name.to_owned(),
+        created_at: "2024-01-01T00:00:00Z",
+        updated_at: "2024-01-01T00:00:00Z",
+        blob,
+    };
     std::fs::write(path, serde_json::to_string_pretty(&v1).unwrap()).unwrap();
 }
 
@@ -784,12 +955,19 @@ fn migration_aborts_when_backup_write_fails() {
 
     let s = VaultStore::new_at_with_policy(vault_dir.clone(), CryptoPolicy::fast_test());
     let result = s.unlock("V", &pw);
-    assert!(result.is_err(), "migration must fail when backup cannot be written");
+    assert!(
+        result.is_err(),
+        "migration must fail when backup cannot be written"
+    );
 
     // Original v1 file must still be intact.
     let on_disk: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(on_disk["version"].as_str().unwrap(), "1", "v1 file must be untouched after backup failure");
+    assert_eq!(
+        on_disk["version"].as_str().unwrap(),
+        "1",
+        "v1 file must be untouched after backup failure"
+    );
 }
 
 #[test]
@@ -811,7 +989,10 @@ fn v1_backup_matches_original_after_successful_migration() {
     let bak_path = vault_dir.join("V.v1.bak");
     assert!(bak_path.exists());
     let bak_bytes = std::fs::read(&bak_path).unwrap();
-    assert_eq!(bak_bytes, original_bytes, ".v1.bak must be byte-for-byte identical to the original v1 file");
+    assert_eq!(
+        bak_bytes, original_bytes,
+        ".v1.bak must be byte-for-byte identical to the original v1 file"
+    );
 }
 
 #[test]
@@ -842,5 +1023,8 @@ fn interrupted_migration_retry_reuses_identical_bak() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().contains(".v1.bak"))
         .count();
-    assert_eq!(bak_count, 1, "retry should reuse existing .v1.bak, not create a new one");
+    assert_eq!(
+        bak_count, 1,
+        "retry should reuse existing .v1.bak, not create a new one"
+    );
 }

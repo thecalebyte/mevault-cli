@@ -16,10 +16,8 @@ pub struct ProcessGrant {
 /// the child (and any grandchildren it spawned) are terminated when the
 /// ephemeral vault session ends or the CLI process crashes.
 pub struct JobObject(
-    #[cfg(target_os = "windows")]
-    windows::Win32::Foundation::HANDLE,
-    #[cfg(not(target_os = "windows"))]
-    (),
+    #[cfg(target_os = "windows")] windows::Win32::Foundation::HANDLE,
+    #[cfg(not(target_os = "windows"))] (),
 );
 
 // SAFETY: HANDLE is an opaque OS pointer we own exclusively via this struct.
@@ -78,8 +76,8 @@ mod win32;
 
 #[cfg(target_os = "windows")]
 pub use win32::{
-    assign_to_job, build_process_chain, create_job_object, find_connection_pid, record_grant,
-    terminate_process, verify_grant,
+    assign_to_job, build_process_chain, create_job_object, find_connection_pid,
+    get_process_creation_time, record_grant, terminate_process, verify_grant,
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -115,4 +113,9 @@ pub fn create_job_object() -> anyhow::Result<JobObject> {
 #[cfg(not(target_os = "windows"))]
 pub fn assign_to_job(_job: &JobObject, _pid: u32) -> anyhow::Result<()> {
     anyhow::bail!("job objects are only supported on Windows")
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_process_creation_time(_pid: u32) -> anyhow::Result<u64> {
+    anyhow::bail!("get_process_creation_time is only supported on Windows")
 }

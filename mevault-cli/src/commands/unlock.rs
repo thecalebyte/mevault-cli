@@ -61,7 +61,11 @@ pub async fn run() -> Result<()> {
 
     let appdata = std::env::var("APPDATA").context("APPDATA env var not set")?;
     let db_path = PathBuf::from(appdata).join("MeVault").join("audit.db");
-    let audit = Arc::new(AuditLog::open(&db_path).await.context("opening audit log")?);
+    let audit = Arc::new(
+        AuditLog::open(&db_path)
+            .await
+            .context("opening audit log")?,
+    );
 
     audit
         .write(
@@ -96,13 +100,17 @@ pub async fn run() -> Result<()> {
     });
 
     let pipe_session = manager.shared();
-    let pipe_audit   = Arc::clone(&audit);
-    let pipe_config  = Arc::new(cfg.clone());
+    let pipe_audit = Arc::clone(&audit);
+    let pipe_config = Arc::new(cfg.clone());
     let ctrl_session = manager.shared();
 
     let (pipe_result, ctrl_result) = tokio::join!(
-        ipc::run_pipe_server(pipe_session, pipe_audit, pipe_config, async move { let _ = pipe_rx.await; }),
-        ipc::run_control_server(ctrl_session, kill_tx, async move { let _ = ctrl_rx.await; }),
+        ipc::run_pipe_server(pipe_session, pipe_audit, pipe_config, async move {
+            let _ = pipe_rx.await;
+        }),
+        ipc::run_control_server(ctrl_session, kill_tx, async move {
+            let _ = ctrl_rx.await;
+        }),
     );
 
     let _ = std::fs::remove_file(&session_path);

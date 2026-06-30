@@ -19,7 +19,7 @@ const ARGON2_PARA: u32 = 4;
 
 // ── KDF bounds (applied before allocation to untrusted vault-file params) ───
 
-const MIN_MEM_KIB: u32 = 16_384;  // 16 MiB
+const MIN_MEM_KIB: u32 = 16_384; // 16 MiB
 const MAX_MEM_KIB: u32 = 262_144; // 256 MiB
 const MIN_ITERS: u32 = 1;
 const MAX_ITERS: u32 = 10;
@@ -60,10 +60,10 @@ impl KdfProfile {
         if mem < min_mem || mem > MAX_MEM_KIB {
             bail!("kdf_mem_kib {mem} outside allowed range [{min_mem}, {MAX_MEM_KIB}]");
         }
-        if iters < MIN_ITERS || iters > MAX_ITERS {
+        if !(MIN_ITERS..=MAX_ITERS).contains(&iters) {
             bail!("kdf_iters {iters} outside allowed range [{MIN_ITERS}, {MAX_ITERS}]");
         }
-        if para < MIN_PARA || para > MAX_PARA {
+        if !(MIN_PARA..=MAX_PARA).contains(&para) {
             bail!("kdf_parallelism {para} outside allowed range [{MIN_PARA}, {MAX_PARA}]");
         }
         Ok(())
@@ -81,13 +81,17 @@ pub struct CryptoPolicy {
 
 impl CryptoPolicy {
     pub fn production() -> Self {
-        Self { kdf_profile: KdfProfile::Argon2idV1 }
+        Self {
+            kdf_profile: KdfProfile::Argon2idV1,
+        }
     }
 
     /// Weak params for unit and integration tests. Only available in debug builds.
     #[cfg(debug_assertions)]
     pub fn fast_test() -> Self {
-        Self { kdf_profile: KdfProfile::FastTest }
+        Self {
+            kdf_profile: KdfProfile::FastTest,
+        }
     }
 
     fn encrypt_params(&self) -> (u32, u32, u32) {
@@ -102,10 +106,18 @@ impl CryptoPolicy {
 
 // ── EncryptedBlob ────────────────────────────────────────────────────────────
 
-fn default_mem_kib() -> u32 { ARGON2_MEM_KIB }
-fn default_iters() -> u32 { ARGON2_ITERS }
-fn default_para() -> u32 { ARGON2_PARA }
-fn default_aad_version() -> u8 { 0 }
+fn default_mem_kib() -> u32 {
+    ARGON2_MEM_KIB
+}
+fn default_iters() -> u32 {
+    ARGON2_ITERS
+}
+fn default_para() -> u32 {
+    ARGON2_PARA
+}
+fn default_aad_version() -> u8 {
+    0
+}
 
 /// Encrypted blob ready for serialization.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -146,7 +158,13 @@ pub fn encrypt(
         let cipher = Aes256Gcm::new(key);
         let nonce = Aes256Gcm::generate_nonce(&mut AesOsRng);
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|e| anyhow::anyhow!("AES-GCM encrypt failed: {e}"))?;
         Ok(EncryptedBlob {
             salt: salt.to_string(),
@@ -178,7 +196,13 @@ pub fn decrypt(
 ) -> Result<Zeroizing<Vec<u8>>> {
     policy.validate_blob_params(blob.kdf_mem_kib, blob.kdf_iters, blob.kdf_parallelism)?;
 
-    let mut key_bytes = derive_key(password, &blob.salt, blob.kdf_mem_kib, blob.kdf_iters, blob.kdf_parallelism)?;
+    let mut key_bytes = derive_key(
+        password,
+        &blob.salt,
+        blob.kdf_mem_kib,
+        blob.kdf_iters,
+        blob.kdf_parallelism,
+    )?;
 
     let result = (|| -> Result<Vec<u8>> {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
@@ -186,16 +210,27 @@ pub fn decrypt(
 
         let nonce_bytes = B64.decode(&blob.nonce).context("decoding nonce")?;
         if nonce_bytes.len() != 12 {
-            bail!("invalid nonce length: expected 12 bytes, got {}", nonce_bytes.len());
+            bail!(
+                "invalid nonce length: expected 12 bytes, got {}",
+                nonce_bytes.len()
+            );
         }
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ct = B64.decode(&blob.ciphertext).context("decoding ciphertext")?;
+        let ct = B64
+            .decode(&blob.ciphertext)
+            .context("decoding ciphertext")?;
 
         let effective_aad: &[u8] = if blob.aad_version >= 1 { aad } else { &[] };
 
         cipher
-            .decrypt(nonce, Payload { msg: ct.as_ref(), aad: effective_aad })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct.as_ref(),
+                    aad: effective_aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("decryption failed — wrong password or corrupt vault"))
     })();
 
@@ -274,7 +309,13 @@ pub fn wrap_dek(
     let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut AesOsRng);
     let ct = cipher
-        .encrypt(&nonce, Payload { msg: dek.as_ref(), aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: dek.as_ref(),
+                aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("key wrap failed: {e}"))?;
     Ok((B64.encode(nonce), B64.encode(ct)))
 }
@@ -293,7 +334,10 @@ pub fn unwrap_dek(
 
     let nonce_bytes = B64.decode(nonce_b64).context("decoding kek nonce")?;
     if nonce_bytes.len() != 12 {
-        bail!("invalid kek nonce length: expected 12, got {}", nonce_bytes.len());
+        bail!(
+            "invalid kek nonce length: expected 12, got {}",
+            nonce_bytes.len()
+        );
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -305,7 +349,10 @@ pub fn unwrap_dek(
     );
 
     if dek_bytes.len() != 32 {
-        bail!("unwrapped DEK has wrong length: expected 32, got {}", dek_bytes.len());
+        bail!(
+            "unwrapped DEK has wrong length: expected 32, got {}",
+            dek_bytes.len()
+        );
     }
     let mut dek = Zeroizing::new([0u8; 32]);
     dek.copy_from_slice(&dek_bytes);
@@ -315,12 +362,22 @@ pub fn unwrap_dek(
 /// Encrypt a vault payload (the secrets JSON) with a DEK using AES-256-GCM.
 ///
 /// Returns `(nonce_b64, ciphertext_b64)`.
-pub fn encrypt_payload(plaintext: &[u8], dek: &Zeroizing<[u8; 32]>, aad: &[u8]) -> Result<(String, String)> {
+pub fn encrypt_payload(
+    plaintext: &[u8],
+    dek: &Zeroizing<[u8; 32]>,
+    aad: &[u8],
+) -> Result<(String, String)> {
     let key = Key::<Aes256Gcm>::from_slice(dek.as_ref());
     let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut AesOsRng);
     let ct = cipher
-        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| anyhow::anyhow!("payload encrypt failed: {e}"))?;
     Ok((B64.encode(nonce), B64.encode(ct)))
 }
@@ -339,7 +396,10 @@ pub fn decrypt_payload(
 
     let nonce_bytes = B64.decode(nonce_b64).context("decoding payload nonce")?;
     if nonce_bytes.len() != 12 {
-        bail!("invalid payload nonce length: expected 12, got {}", nonce_bytes.len());
+        bail!(
+            "invalid payload nonce length: expected 12, got {}",
+            nonce_bytes.len()
+        );
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -362,13 +422,17 @@ mod tests {
     use super::*;
 
     fn pw(s: &str) -> SecretString {
-        SecretString::new(s.to_owned().into())
+        SecretString::new(s.to_owned())
     }
 
     #[cfg(debug_assertions)]
-    fn policy() -> CryptoPolicy { CryptoPolicy::fast_test() }
+    fn policy() -> CryptoPolicy {
+        CryptoPolicy::fast_test()
+    }
     #[cfg(not(debug_assertions))]
-    fn policy() -> CryptoPolicy { CryptoPolicy::production() }
+    fn policy() -> CryptoPolicy {
+        CryptoPolicy::production()
+    }
 
     #[test]
     fn round_trip() {
@@ -393,7 +457,10 @@ mod tests {
     fn aad_mismatch_fails() {
         let p = policy();
         let blob = encrypt(b"data", &pw("password"), b"vault-a", &p).expect("encrypt");
-        assert!(decrypt(&blob, &pw("password"), b"vault-b", &p).is_err(), "wrong AAD must fail");
+        assert!(
+            decrypt(&blob, &pw("password"), b"vault-b", &p).is_err(),
+            "wrong AAD must fail"
+        );
     }
 
     #[test]
@@ -439,7 +506,10 @@ mod tests {
         let mut blob = encrypt(b"legacy", &pw("password"), &[], &p).expect("encrypt");
         blob.aad_version = 0;
         let result = decrypt(&blob, &pw("password"), b"any-vault-name", &p);
-        assert!(result.is_ok(), "legacy blob must decrypt ignoring aad argument");
+        assert!(
+            result.is_ok(),
+            "legacy blob must decrypt ignoring aad argument"
+        );
         assert_eq!(&*result.unwrap(), b"legacy");
     }
 
@@ -461,7 +531,10 @@ mod tests {
         let p = policy();
         let mut blob = encrypt(b"data", &pw("pw"), b"v", &p).expect("encrypt");
         blob.kdf_mem_kib = MAX_MEM_KIB + 1;
-        assert!(decrypt(&blob, &pw("pw"), b"v", &p).is_err(), "mem above max must be rejected");
+        assert!(
+            decrypt(&blob, &pw("pw"), b"v", &p).is_err(),
+            "mem above max must be rejected"
+        );
     }
 
     #[test]
@@ -469,7 +542,10 @@ mod tests {
         let p = policy();
         let mut blob = encrypt(b"data", &pw("pw"), b"v", &p).expect("encrypt");
         blob.kdf_iters = 0;
-        assert!(decrypt(&blob, &pw("pw"), b"v", &p).is_err(), "zero iterations must be rejected");
+        assert!(
+            decrypt(&blob, &pw("pw"), b"v", &p).is_err(),
+            "zero iterations must be rejected"
+        );
     }
 
     #[test]
@@ -477,7 +553,10 @@ mod tests {
         let p = policy();
         let mut blob = encrypt(b"data", &pw("pw"), b"v", &p).expect("encrypt");
         blob.kdf_iters = MAX_ITERS + 1;
-        assert!(decrypt(&blob, &pw("pw"), b"v", &p).is_err(), "iters above max must be rejected");
+        assert!(
+            decrypt(&blob, &pw("pw"), b"v", &p).is_err(),
+            "iters above max must be rejected"
+        );
     }
 
     #[test]
@@ -485,7 +564,10 @@ mod tests {
         let p = policy();
         let mut blob = encrypt(b"data", &pw("pw"), b"v", &p).expect("encrypt");
         blob.kdf_parallelism = 0;
-        assert!(decrypt(&blob, &pw("pw"), b"v", &p).is_err(), "zero parallelism must be rejected");
+        assert!(
+            decrypt(&blob, &pw("pw"), b"v", &p).is_err(),
+            "zero parallelism must be rejected"
+        );
     }
 
     #[test]
@@ -493,7 +575,10 @@ mod tests {
         let p = policy();
         let mut blob = encrypt(b"data", &pw("pw"), b"v", &p).expect("encrypt");
         blob.kdf_parallelism = MAX_PARA + 1;
-        assert!(decrypt(&blob, &pw("pw"), b"v", &p).is_err(), "parallelism above max must be rejected");
+        assert!(
+            decrypt(&blob, &pw("pw"), b"v", &p).is_err(),
+            "parallelism above max must be rejected"
+        );
     }
 
     // ── Envelope encryption tests ──────────────────────────────────────────
@@ -504,7 +589,8 @@ mod tests {
         let dek = generate_dek();
         let salt = new_kek_salt();
         let (mem, iters, para) = p.kdf_profile.params();
-        let kek = derive_kek(&pw("passphrase"), salt.as_str(), mem, iters, para, &p).expect("derive");
+        let kek =
+            derive_kek(&pw("passphrase"), salt.as_str(), mem, iters, para, &p).expect("derive");
         let aad = b"mevault-kek\0vault-id\0vault-name";
         let (nonce, ct) = wrap_dek(&dek, &kek, aad).expect("wrap");
         let recovered = unwrap_dek(&nonce, &ct, &kek, aad).expect("unwrap");
@@ -518,7 +604,8 @@ mod tests {
         let salt = new_kek_salt();
         let (mem, iters, para) = p.kdf_profile.params();
         let kek = derive_kek(&pw("passphrase"), salt.as_str(), mem, iters, para, &p).expect("kek");
-        let bad_kek = derive_kek(&pw("wrong"), salt.as_str(), mem, iters, para, &p).expect("bad-kek");
+        let bad_kek =
+            derive_kek(&pw("wrong"), salt.as_str(), mem, iters, para, &p).expect("bad-kek");
         let aad = b"test-aad";
         let (nonce, ct) = wrap_dek(&dek, &kek, aad).expect("wrap");
         assert!(unwrap_dek(&nonce, &ct, &bad_kek, aad).is_err());

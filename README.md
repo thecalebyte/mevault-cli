@@ -11,6 +11,21 @@ mevault run uvicorn app.main:app --reload
 
 Your server reads secrets directly from a named pipe. Claude, Copilot, Cursor: none of them can reach those values, even if they try to spawn your server themselves.
 
+---
+
+> **What's in this repository**
+>
+> This repo hosts release artifacts for two separate products:
+>
+> | Download | What it is | Source |
+> |---|---|---|
+> | `mevault-windows-x64.exe` | **CLI** — the open-source command-line tool | ✅ This repo (`cli-v*` releases) |
+> | `MeVault_*_x64-setup.exe` / `.msi` | **Desktop app** — GUI + system tray | Closed source (`app-v*` releases) |
+>
+> The CLI (`mevault-cli`), core library (`mevault-core`), and Rust SDK (`mevault-sdk`) are open source under Apache 2.0. The desktop app source is not publicly available.
+
+---
+
 ## The problem
 
 AI coding agents run in your terminal. They can read environment variables, `.env` files, shell history, and any file in your project. When you give an agent access to fix a bug, it potentially has access to every credential loaded in your session.
@@ -109,15 +124,21 @@ The core named-pipe IPC and identity model is Windows-specific today. macOS and 
 
 ## Installation
 
-### winget (recommended)
+### CLI (`mevault.exe`) — open source
+
+**winget (recommended)**
 
 ```powershell
 winget install MeVault.MeVaultCLI
 ```
 
-### Direct download
+**Direct download**
 
-Download `mevault.exe` from the [latest release](https://github.com/thecalebyte/mevault-cli/releases/latest) and place it somewhere on your `PATH`.
+Download `mevault-windows-x64.exe` from the [latest `cli-v*` release](https://github.com/thecalebyte/mevault-cli/releases), rename it to `mevault.exe`, and place it somewhere on your `PATH`.
+
+### Desktop app — closed source
+
+Download `MeVault_*_x64-setup.exe` (NSIS installer) or `MeVault_*_x64_en-US.msi` from the [latest `app-v*` release](https://github.com/thecalebyte/mevault-cli/releases). The desktop app includes the CLI and adds a system tray icon, a secrets dashboard, and a policy editor.
 
 ### Build from source
 
@@ -238,7 +259,7 @@ db_url = get_secret('DATABASE_URL')
 
 ### Wire protocol
 
-The runtime pipe uses newline-delimited JSON (one request per connection):
+The runtime pipe uses newline-delimited JSON (one request per connection). Requests are limited to 4 096 bytes; responses to 1 MB. The server closes connections that exceed these limits or that do not send data within 10 seconds.
 
 ```
 →  {"op":"get_secret","name":"DATABASE_URL"}\n
@@ -249,6 +270,14 @@ The runtime pipe uses newline-delimited JSON (one request per connection):
 
 ←  {"ok":false,"error":"access_denied","reason":"parent process is claude.exe"}\n
 ```
+
+Optional fields for clients that want correlation:
+
+```json
+{"op":"get_secret","name":"DATABASE_URL","protocol_version":1,"request_id":"550e8400-..."}
+```
+
+`protocol_version` defaults to `1` if omitted. `request_id` is echoed back in the response when present.
 
 ## Commands
 
@@ -324,11 +353,56 @@ Status: active
 
 ### `mevault list`
 
-List secret names in the vault (values are never shown).
+List secret names. If a session is active, queries the live pipe (no password needed). Falls back to prompting for the vault password if no session is running. Values are never shown.
 
 ```powershell
 mevault list
 mevault list --vault "AuthService"
+```
+
+### `mevault verify <name>`
+
+Check that a secret matches an expected value using constant-time comparison. Does not print the stored value. Exit code: `0` = match, `1` = mismatch, `2` = error.
+
+```powershell
+mevault verify DATABASE_URL
+# Prompts: "Expected value: " (hidden input)
+# Outputs: ✓ match  or  ✗ mismatch
+```
+
+### `mevault get <name> --reveal`
+
+Print the plaintext value of a secret to stdout. Requires `allow_cli_reveal = true` in `mevault.toml` and must be run in an interactive terminal (not piped). The reveal is written to the audit log.
+
+```powershell
+mevault get DATABASE_URL --reveal
+```
+
+### `mevault config validate`
+
+Parse and validate `mevault.toml`. Checks rule syntax, wildcard double opt-in, and whether configured executables exist on disk.
+
+```powershell
+mevault config validate
+```
+
+### `mevault config migrate`
+
+Back up `mevault.toml` and convert old `[[allow_list.rules]]` entries to the current `[[process]]` format.
+
+```powershell
+mevault config migrate
+```
+
+### `mevault doctor`
+
+Check all system components: CLI version, `mevault.toml`, vault file, active session, pipe health, policy, SDK availability, and auto-updater.
+
+```powershell
+mevault doctor
+
+# Show which rule would match a given executable and whether it would be allowed:
+mevault doctor --command python.exe
 ```
 
 ### `mevault log`
@@ -374,7 +448,7 @@ mevault import secrets.env.mvenc
 
 ### `mevault.toml`
 
-Created by `mevault init`. Defines the allow-list for your project.
+Created by `mevault init`. Defines the process rules for your project.
 
 ```toml
 [project]
@@ -392,23 +466,32 @@ require_identity_check = true
 require_signature_check = true
 require_parent_check = true
 require_working_dir_check = true
+allow_cli_reveal = false   # set true to allow `mevault get <name> --reveal`
 
-[[allow_list.rules]]
+[[process]]
 name = "node"
-exe_path = "**\\node.exe"
-parent_not = ["claude.exe", "cursor.exe", "windsurf.exe"]
+executable = "node.exe"
 working_dir = "${PROJECT_ROOT}"
-signed = true
-secrets = ["*"]
-
-[[allow_list.rules]]
-name = "uvicorn"
-exe_path = "**\\uvicorn.exe"
-parent_not = ["claude.exe", "cursor.exe", "windsurf.exe"]
-working_dir = "${PROJECT_ROOT}"
-signed = true
 secrets = ["DATABASE_URL", "REDIS_URL"]
+allow_all_secrets = false
+
+[[process]]
+name = "uvicorn"
+executable = "uvicorn.exe"
+working_dir = "${PROJECT_ROOT}"
+secrets = ["DATABASE_URL", "REDIS_URL"]
+allow_all_secrets = false
+
+# To allow access to ALL secrets, both fields are required:
+[[process]]
+name = "my-trusted-app"
+executable = "myapp.exe"
+working_dir = "${PROJECT_ROOT}"
+secrets = ["*"]
+allow_all_secrets = true   # explicit double opt-in required
 ```
+
+Use `mevault config validate` to check your rules, and `mevault config migrate` to convert old `[[allow_list.rules]]` configs to the new `[[process]]` format.
 
 ### System policy (`%ProgramData%\MeVault\policy.toml`)
 
@@ -467,44 +550,23 @@ Earlier versions used `MEVAULT_TOKEN` in the environment and a token in `session
 
 The current design uses only the kernel-provided process identity. There is nothing in the environment or on disk that an agent can steal to impersonate an approved process.
 
-## Building from source
-
-```powershell
-git clone https://github.com/thecalebyte/mevault-cli.git
-cd mevault-cli
-cargo build --release
-```
-
-### Running tests
-
-```powershell
-# Unit + IPC + integration tests
-cargo test -p mevault-core
-
-# SDK tests
-cargo test -p mevault-sdk
-
-# Cross-process file-lock correctness test (requires the test helper binary)
-cargo test -p mevault-core --features test-helper
-```
-
-### Project structure
+## Project structure
 
 ```
 crates/
-  mevault-core/       shared library: IPC, identity, allow-list, audit, crypto
+  mevault-core/       shared library: IPC, identity, grants, config, audit, crypto
     src/
-      ipc/            named pipe servers (runtime + control) and client helpers
+      ipc/            named pipe servers (runtime + control) and protocol
       identity/       Win32 process identity, Authenticode, Job Objects
-      allowlist/      access control engine (TOML rules)
+      grants/         LaunchGrant registry (PID + creation-timestamp key)
       session/        session lifecycle, DEK caching and auto-expiry
       vault/          per-project envelope-encrypted vault store (v2 KEK/DEK format)
       audit/          SQLite audit log
-      config/         TOML config parsing + system policy
+      config/         TOML config parsing (ProcessRule) and system policy
       crypto/         AES-256-GCM + Argon2id for vault and export/import
       export/         export/import module (.env.mvenc / .mvx formats)
     tests/
-      vault_integration.rs
+      grants_security.rs    PID-reuse, wildcard opt-in, zero-timestamp panic
 
   mevault-cli/        CLI binary: argument parsing, calls mevault-core
     src/

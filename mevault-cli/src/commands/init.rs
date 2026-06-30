@@ -1,14 +1,11 @@
 use anyhow::{bail, Context, Result};
-use mevault_core::{
-    config::ProjectConfig,
-    vault::SecretStoreBridge,
-};
+use mevault_core::{config::ProjectConfig, vault::SecretStoreBridge};
 use secrecy::SecretString;
 use std::path::PathBuf;
 
 pub fn run(name: Option<String>, vault_dir: Option<PathBuf>) -> Result<()> {
-    let project_root = vault_dir
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let project_root =
+        vault_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let toml_path = project_root.join("mevault.toml");
     if toml_path.exists() {
@@ -45,8 +42,7 @@ pub fn run(name: Option<String>, vault_dir: Option<PathBuf>) -> Result<()> {
 
     // Write mevault.toml
     let cfg = ProjectConfig::new(&vault_name, &vault_name);
-    cfg.save(&project_root)
-        .context("writing mevault.toml")?;
+    cfg.save(&project_root).context("writing mevault.toml")?;
 
     println!("\nSetup complete!");
     println!("  Vault:   {vault_name}");
@@ -61,18 +57,16 @@ pub fn run(name: Option<String>, vault_dir: Option<PathBuf>) -> Result<()> {
 
 fn read_password_confirmed() -> Result<SecretString> {
     loop {
-        let pw1 = rpassword::prompt_password("Password: ")
-            .context("reading password")?;
+        let pw1 = rpassword::prompt_password("Password: ").context("reading password")?;
         if pw1.len() < 12 {
             eprintln!("Password must be at least 12 characters. Try again.");
             continue;
         }
-        let pw2 = rpassword::prompt_password("Confirm:  ")
-            .context("reading confirmation")?;
+        let pw2 = rpassword::prompt_password("Confirm:  ").context("reading confirmation")?;
         if pw1 != pw2 {
             eprintln!("Passwords do not match. Try again.");
             continue;
         }
-        return Ok(SecretString::new(pw1.into()));
+        return Ok(SecretString::new(pw1));
     }
 }

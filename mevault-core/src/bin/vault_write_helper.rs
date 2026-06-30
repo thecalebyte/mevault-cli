@@ -19,12 +19,10 @@ fn main() {
         password: String,
     }
 
-    let input: HelperInput =
-        serde_json::from_reader(std::io::stdin().lock())
-            .unwrap_or_else(|e| {
-                eprintln!("vault-write-helper: invalid stdin JSON: {e}");
-                std::process::exit(2);
-            });
+    let input: HelperInput = serde_json::from_reader(std::io::stdin().lock()).unwrap_or_else(|e| {
+        eprintln!("vault-write-helper: invalid stdin JSON: {e}");
+        std::process::exit(2);
+    });
 
     let vault_dir = std::path::PathBuf::from(&args[1]);
     let vault_name = &args[2];
@@ -38,8 +36,8 @@ fn main() {
     #[cfg(not(debug_assertions))]
     let store = mevault_core::vault::VaultStore::new_at(vault_dir);
 
-    let pw = secrecy::SecretString::new(input.password.into());
-    let val = secrecy::SecretString::new(input.secret_value.into());
+    let pw = secrecy::SecretString::new(input.password);
+    let val = secrecy::SecretString::new(input.secret_value);
 
     if let Err(e) = store.set_secret(secret_name, &val, vault_name, Some(&pw)) {
         eprintln!("vault-write-helper: set_secret failed: {e}");

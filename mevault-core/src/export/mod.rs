@@ -74,10 +74,15 @@ pub fn export_encrypted_env(
     }
     let plaintext = (lines.join("\n") + "\n").into_bytes();
 
-    let blob = crypto::encrypt(&plaintext, password, b"mevault-env-enc", &CryptoPolicy::production()).context("encrypting export")?;
+    let blob = crypto::encrypt(
+        &plaintext,
+        password,
+        b"mevault-env-enc",
+        &CryptoPolicy::production(),
+    )
+    .context("encrypting export")?;
     let json = serde_json::to_string_pretty(&blob).context("serializing encrypted export")?;
-    std::fs::write(path, json)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(secrets.len())
 }
 
@@ -89,7 +94,13 @@ pub fn export_mvx(
     password: &SecretString,
 ) -> Result<usize> {
     let inner_json = serde_json::to_string(secrets).context("serializing secret list")?;
-    let blob = crypto::encrypt(inner_json.as_bytes(), password, vault_name.as_bytes(), &CryptoPolicy::production()).context("encrypting mvx")?;
+    let blob = crypto::encrypt(
+        inner_json.as_bytes(),
+        password,
+        vault_name.as_bytes(),
+        &CryptoPolicy::production(),
+    )
+    .context("encrypting mvx")?;
 
     let bundle = MvxBundle {
         format: "mevault-export".into(),
@@ -98,13 +109,16 @@ pub fn export_mvx(
         exported_at: Utc::now().to_rfc3339(),
         algorithm: "AES-256-GCM".into(),
         kdf: "argon2id".into(),
-        kdf_params: KdfParams { m: 65_536, t: 3, p: 4 },
+        kdf_params: KdfParams {
+            m: 65_536,
+            t: 3,
+            p: 4,
+        },
         blob,
     };
 
     let json = serde_json::to_string_pretty(&bundle).context("serializing mvx")?;
-    std::fs::write(path, json)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
     Ok(secrets.len())
 }
 
@@ -112,28 +126,42 @@ pub fn export_mvx(
 
 /// Parse a plaintext `.env` file into entries.
 pub fn import_dotenv(path: &Path) -> Result<Vec<SecretEntry>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(parse_env_lines(&content))
 }
 
 /// Decrypt and parse a `.env.mvenc` file.
 pub fn import_encrypted_env(path: &Path, password: &SecretString) -> Result<Vec<SecretEntry>> {
-    let json = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let json =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let blob: crypto::EncryptedBlob =
         serde_json::from_str(&json).context("parsing encrypted env file")?;
-    let plaintext = crypto::decrypt(&blob, password, b"mevault-env-enc", &CryptoPolicy::production()).context("decrypting env file")?;
-    let text = std::str::from_utf8(&plaintext).context("decrypted content is not UTF-8")?.to_owned();
+    let plaintext = crypto::decrypt(
+        &blob,
+        password,
+        b"mevault-env-enc",
+        &CryptoPolicy::production(),
+    )
+    .context("decrypting env file")?;
+    let text = std::str::from_utf8(&plaintext)
+        .context("decrypted content is not UTF-8")?
+        .to_owned();
     Ok(parse_env_lines(&text))
 }
 
 /// Decrypt and parse a `.mvx` bundle.
 pub fn import_mvx(path: &Path, password: &SecretString) -> Result<(String, Vec<SecretEntry>)> {
-    let json = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let json =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let bundle: MvxBundle = serde_json::from_str(&json).context("parsing mvx file")?;
-    let plaintext = crypto::decrypt(&bundle.blob, password, bundle.vault.as_bytes(), &CryptoPolicy::production()).context("decrypting mvx")?;
+    let plaintext = crypto::decrypt(
+        &bundle.blob,
+        password,
+        bundle.vault.as_bytes(),
+        &CryptoPolicy::production(),
+    )
+    .context("decrypting mvx")?;
     let entries: Vec<SecretEntry> =
         serde_json::from_slice(&plaintext).context("parsing decrypted secret list")?;
     Ok((bundle.vault, entries))
@@ -181,14 +209,20 @@ fn parse_env_lines(text: &str) -> Vec<SecretEntry> {
             if key.is_empty() {
                 return None;
             }
-            Some(SecretEntry { name: key, value: val })
+            Some(SecretEntry {
+                name: key,
+                value: val,
+            })
         })
         .collect()
 }
 
 /// Minimal shell quoting — wrap in single quotes if value has spaces/special chars.
 fn shell_quote(val: &str) -> String {
-    if val.chars().any(|c| matches!(c, ' ' | '\t' | '"' | '\'' | '$' | '\\' | '`' | '!')) {
+    if val
+        .chars()
+        .any(|c| matches!(c, ' ' | '\t' | '"' | '\'' | '$' | '\\' | '`' | '!'))
+    {
         // Escape any single quotes inside, then wrap.
         format!("'{}'", val.replace('\'', r"'\''"))
     } else {
@@ -203,13 +237,19 @@ mod tests {
 
     fn entries() -> Vec<SecretEntry> {
         vec![
-            SecretEntry { name: "DB_URL".into(), value: "postgres://localhost".into() },
-            SecretEntry { name: "API_KEY".into(), value: "sk-abc123".into() },
+            SecretEntry {
+                name: "DB_URL".into(),
+                value: "postgres://localhost".into(),
+            },
+            SecretEntry {
+                name: "API_KEY".into(),
+                value: "sk-abc123".into(),
+            },
         ]
     }
 
     fn pw() -> SecretString {
-        SecretString::new("test-password-phrase-here".to_owned().into())
+        SecretString::new("test-password-phrase-here".to_owned())
     }
 
     #[test]
@@ -250,7 +290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.mvx");
         export_mvx(&entries(), &path, "V", &pw()).unwrap();
-        let bad = SecretString::new("wrong".to_owned().into());
+        let bad = SecretString::new("wrong".to_owned());
         assert!(import_mvx(&path, &bad).is_err());
     }
 }

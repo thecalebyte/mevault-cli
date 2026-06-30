@@ -17,15 +17,12 @@ pub async fn run(
         return Ok(());
     }
 
-    let log = AuditLog::open(&db_path).await.context("opening audit log")?;
+    let log = AuditLog::open(&db_path)
+        .await
+        .context("opening audit log")?;
 
     let events = log
-        .query(
-            event_type.as_deref(),
-            secret.as_deref(),
-            since_hours,
-            tail,
-        )
+        .query(event_type.as_deref(), secret.as_deref(), since_hours, tail)
         .await
         .context("querying audit log")?;
 
@@ -36,16 +33,15 @@ pub async fn run(
 
     if let Some(path) = export_path {
         let json = serde_json::to_string_pretty(&events).context("serializing events")?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
         println!("Exported {} event(s) to {}.", events.len(), path.display());
         return Ok(());
     }
 
     // Terminal display.
     println!(
-        "{:<20} {:<10} {:<25} {:<20} {}",
-        "Timestamp", "Event", "Secret", "Process", "Reason"
+        "{:<20} {:<10} {:<25} {:<20} Reason",
+        "Timestamp", "Event", "Secret", "Process"
     );
     println!("{}", "─".repeat(90));
     for e in &events {
@@ -65,9 +61,7 @@ pub async fn run(
             _ => "·",
         };
 
-        println!(
-            "{ts:<20} {prefix}{event:<9} {secret:<25} {process:<20} {reason}"
-        );
+        println!("{ts:<20} {prefix}{event:<9} {secret:<25} {process:<20} {reason}");
     }
     println!("{}", "─".repeat(90));
     println!("{} event(s) shown.", events.len());
